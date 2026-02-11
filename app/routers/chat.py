@@ -138,6 +138,7 @@ async def chat_completions(
     if request.stream:
         # Streaming response
         async def generate_stream():
+            stream_completed = False
             try:
                 async for chunk in engine.run_streaming(
                     messages=request.messages,
@@ -149,6 +150,7 @@ async def chat_completions(
                     }
                     await asyncio.sleep(0)  # Yield control
                 yield {"data": "[DONE]"}
+                stream_completed = True
             except Exception as e:
                 yield {
                     "data": json.dumps({
@@ -158,18 +160,19 @@ async def chat_completions(
                         }
                     })
                 }
+            finally:
+                # Only persist quota after stream completes successfully
+                if stream_completed:
+                    latency_ms = int((time.time() - start_time) * 1000)
+                    api_key.used_quota += estimated_cost
+                    db.add(api_key)
+                    await db.commit()
+                    await db.refresh(api_key)
 
         response = EventSourceResponse(
             generate_stream(),
             media_type="text/event-stream"
         )
-
-        # Calculate usage and persist quota update
-        latency_ms = int((time.time() - start_time) * 1000)
-        api_key.used_quota += estimated_cost
-        db.add(api_key)
-        await db.commit()
-        await db.refresh(api_key)
 
         return response
 
