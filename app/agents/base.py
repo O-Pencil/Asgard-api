@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
 from typing import List, AsyncGenerator, Dict, Any
 from app.schemas import Message
+from app.llm.ollama import get_ollama_provider
 
 
 class AgentEngine(ABC):
@@ -28,25 +29,67 @@ class AgentEngine(ABC):
         max_tokens: int = 4096,
         **kwargs
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Execute agent with streaming response"""
-        response = await self.run(messages, temperature, max_tokens, **kwargs)
+        """Execute agent with streaming response using Ollama"""
+        from app.config import settings
+        from app.schemas import Message
+        import json
 
-        # Tokenize response (simple word-by-word streaming)
-        words = response.split()
-        for i, word in enumerate(words):
-            chunk = {
-                "id": f"chunk-{i}",
-                "object": "chat.completion.chunk",
-                "created": 0,
-                "model": self.name,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"content": word + " "},
-                    "finish_reason": None if i < len(words) - 1 else "stop"
-                }]
-            }
-            yield chunk
-            await self._simulate_delay()
+        if settings.use_ollama:
+            try:
+                ollama = get_ollama_provider()
+                # Convert messages to dict format
+                msg_list = [{"role": m.role, "content": m.content} for m in messages]
+
+                async for chunk in ollama.chat(msg_list, temperature, max_tokens, stream=True):
+                    if "error" in chunk:
+                        yield {
+                            "error": {
+                                "message": chunk["error"]["message"],
+                                "type": chunk["error"].get("type", "server_error")
+                            }
+                        }
+                        return
+
+                    # Convert Ollama format to OpenAI format
+                    ollama_msg = chunk.get("message", {})
+                    openai_chunk = {
+                        "id": f"chunk-{chunk.get('created_at', 0)}",
+                        "object": "chat.completion.chunk",
+                        "created": chunk.get("created_at", 0),
+                        "model": self.name,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": ollama_msg.get("content", "")},
+                            "finish_reason": "stop" if chunk.get("done", False) else None
+                        }]
+                    }
+                    yield openai_chunk
+                    return
+            except Exception as e:
+                yield {
+                    "error": {
+                        "message": str(e),
+                        "type": "server_error"
+                    }
+                }
+        else:
+            # Fallback to non-streaming response
+            response = await self.run(messages, temperature, max_tokens, **kwargs)
+            words = response.split()
+            for i, word in enumerate(words):
+                chunk = {
+                    "id": f"chunk-{i}",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": self.name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": word + " "},
+                        "finish_reason": None if i < len(words) - 1 else "stop"
+                    }]
+                }
+                yield chunk
+                await self._simulate_delay()
 
     async def _simulate_delay(self):
         """Simulate streaming delay"""
@@ -100,9 +143,22 @@ class PromptTemplateAgent(AgentEngine):
         temperature: float,
         max_tokens: int
     ) -> str:
-        """Process prompt with LLM (to be implemented with actual LLM call)"""
-        # Placeholder - in production, integrate with OpenAI/Anthropic API
-        return await self._simulate_llm_response(prompt)
+        """Process prompt with Ollama LLM"""
+        from app.config import settings
+
+        if settings.use_ollama:
+            try:
+                ollama = get_ollama_provider()
+                # Convert prompt to messages format
+                messages = [{"role": "user", "content": prompt}]
+                response = await ollama.chat_once(messages, temperature, max_tokens)
+                return response
+            except Exception as e:
+                # Fallback to simulation if Ollama not available
+                print(f"Ollama error: {e}, using simulation")
+                return await self._simulate_llm_response(prompt)
+        else:
+            return await self._simulate_llm_response(prompt)
 
     async def _simulate_llm_response(self, prompt: str) -> str:
         """Simulate LLM response for MVP"""
