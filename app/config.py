@@ -24,6 +24,14 @@ class Settings(BaseSettings):
     # Rate Limiting
     rate_limit_per_minute: int = 60
 
+    # Redis Cache
+    redis_url: str = ""  # Redis connection URL, empty means disabled
+
+    # Ollama (Local LLM)
+    ollama_base_url: str = "http://localhost:11434"
+    ollama_model: str = "qwen2.5"
+    use_ollama: bool = True  # Set to False to use OpenAI API instead
+
     # Logging
     log_level: str = "INFO"
 
