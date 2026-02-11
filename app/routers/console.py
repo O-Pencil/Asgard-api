@@ -112,7 +112,7 @@ async def rotate_api_key(
     old_key.key_hash = new_key_hash
     old_key.key_prefix = prefix
     old_key.created_at = datetime.utcnow()
-    old_key.used_quota = 0  // Reset usage
+    old_key.used_quota = 0  # Reset usage
 
     await db.commit()
 
