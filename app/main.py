@@ -11,6 +11,8 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.database import init_db, close_db
+from app.cache import init_cache, close_cache
+from app.middleware.rate_limit import rate_limit_middleware
 from app.routers import auth, agents, chat, console
 
 
@@ -29,11 +31,15 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Asgard API...")
     await init_db()
     logger.info("Database initialized")
+    await init_cache()
+    logger.info("Cache initialized")
 
     yield
 
     # Shutdown
     logger.info("Shutting down Asgard API...")
+    await close_cache()
+    logger.info("Cache connections closed")
     await close_db()
     logger.info("Database connections closed")
 
@@ -49,15 +55,23 @@ app = FastAPI(
 )
 
 # CORS middleware
-# 安全配置：生产环境使用明确的白名单，调试模式禁用CORS
+# 安全配置：生产环境使用明确的白名单，调试模式使用允许的主机列表
 cors_origins = settings.allowed_hosts.split(",") if settings.allowed_hosts else []
+if settings.debug:
+    # 调试模式：使用明确的白名单，不允许所有来源
+    cors_origins = cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=cors_origins if not settings.debug else [],
+    allow_origins=cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Rate limiting middleware
+@app.middleware("http")
+async def rate_limit(request: Request, call_next):
+    return await rate_limit_middleware(request, call_next)
 
 
 # Exception handlers
