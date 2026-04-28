@@ -101,6 +101,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = Field(default=4096, ge=1, le=65536)
     stream: Optional[bool] = False
     user: Optional[str] = None
+    session_id: Optional[str] = None
 
 
 class ChatCompletionChoice(BaseModel):
