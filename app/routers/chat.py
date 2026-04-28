@@ -1,8 +1,19 @@
+"""
+Asgard Chat Completions Router
+
+[WHO]  Provides /v1/chat/completions endpoint with OpenAI-compatible API
+[FROM] Depends on app.services.pencil_gateway, app.agents, app.auth, app.models
+[TO]   Called by external clients (Cursor, VS Code, nanopencil-editor)
+[HERE] app/routers/chat.py within Asgard API backend
+"""
+
 import json
 import time
 import asyncio
+import logging
 from datetime import datetime
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
+
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,16 +28,20 @@ from app.config import settings
 from app.agents.base import AgentEngine
 from app.agents.impl import CodeRefactorAgent, HanHanStyleAgent
 
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["Chat Completion"])
 
 
-# Agent Engine Registry
+# ---------------------------------------------------------------------------
+# Agent Engine Registry (built-in asgard/* agents)
+# ---------------------------------------------------------------------------
+
 _agent_registry: dict[str, AgentEngine] = {}
 
 
 def get_agent_engine(agent_id: str) -> AgentEngine:
-    """Get or create agent engine instance"""
+    """Get or create built-in agent engine instance"""
     if agent_id not in _agent_registry:
         if agent_id == "asgard/code-refactor":
             _agent_registry[agent_id] = CodeRefactorAgent()
@@ -40,9 +55,72 @@ def get_agent_engine(agent_id: str) -> AgentEngine:
     return _agent_registry[agent_id]
 
 
+# ---------------------------------------------------------------------------
+# Pencil Agent helpers
+# ---------------------------------------------------------------------------
+
+def is_pencil_agent(agent: Agent) -> bool:
+    """
+    Check if an agent is a Pencil Agent (routed to Pencil Agent Gateway).
+
+    Judgment is based on DB agent record, not just user-supplied model field.
+    """
+    params = agent.parameters or {}
+    return (
+        agent.agent_id.startswith("pencil/")
+        or params.get("agent_type") == "pencil-agent"
+    )
+
+
+def enforce_user_can_call(api_key: APIKey, agent: Agent):
+    """
+    Verify the API key owner is allowed to call this agent.
+
+    - Public asgard/* agents: allowed for all authenticated users.
+    - pencil/* agents: must match owner_user_id.
+    """
+    params = agent.parameters or {}
+    if params.get("agent_type") == "pencil-agent" or agent.agent_id.startswith("pencil/"):
+        owner_user_id = params.get("owner_user_id")
+        if owner_user_id is not None and str(owner_user_id) != str(api_key.user_id):
+            raise HTTPException(
+                status_code=403,
+                detail="Agent not allowed for this API key"
+            )
+
+
+# ---------------------------------------------------------------------------
+# PencilGateway singleton accessor
+# ---------------------------------------------------------------------------
+
+_pencil_gateway = None
+
+
+def get_pencil_gateway():
+    """
+    Get the global PencilAgentBackend instance.
+    Set during app startup in main.py lifespan.
+    """
+    if _pencil_gateway is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Pencil Agent Gateway not configured"
+        )
+    return _pencil_gateway
+
+
+def set_pencil_gateway(gateway):
+    """Set the global PencilAgentBackend instance (called from main.py)."""
+    global _pencil_gateway
+    _pencil_gateway = gateway
+
+
+# ---------------------------------------------------------------------------
+# Token counting & usage log helpers
+# ---------------------------------------------------------------------------
+
 async def count_tokens(text: str) -> int:
     """Simple token counter (rough estimate)"""
-    # In production, use tiktoken
     return len(text) // 4
 
 
@@ -55,7 +133,7 @@ async def save_usage_log(
     completion_tokens: int,
     cost: float,
     latency_ms: int,
-    status: str,
+    log_status: str,
     error_message: str = None
 ):
     """Save usage log"""
@@ -68,34 +146,37 @@ async def save_usage_log(
         completion_tokens=completion_tokens,
         total_tokens=prompt_tokens + completion_tokens,
         cost=cost,
-        status=status,
+        status=log_status,
         error_message=error_message,
         latency_ms=latency_ms,
-        client_ip="",  # Get from request
+        client_ip="",
     )
     db.add(log)
     await db.commit()
 
 
+# ---------------------------------------------------------------------------
+# Chat Completions endpoint
+# ---------------------------------------------------------------------------
+
 @router.post("/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
+    raw_request: Request,
     api_key: APIKey = Depends(get_api_key_from_header),
     db: AsyncSession = Depends(get_db)
 ):
     """
-    OpenAI-compatible Chat Completions endpoint
+    OpenAI-compatible Chat Completions endpoint.
 
-    Compatible with:
-    - OpenAI Chat Completions API format
-    - Cursor, Continue, and other IDE integrations
+    Routes to:
+    - pencil/* agents  -> Pencil Agent Gateway (proxy)
+    - asgard/* agents  -> Built-in AgentEngine (local)
     """
     start_time = time.time()
 
-    # Extract agent_id from model field
+    # --- Load agent from DB ---
     agent_id = request.model
-
-    # Get agent info
     result = await db.execute(
         select(Agent).where(Agent.agent_id == agent_id)
     )
@@ -113,18 +194,20 @@ async def chat_completions(
             detail=f"Agent '{agent_id}' is not available"
         )
 
-    # Get user
+    # --- Load user ---
     result = await db.execute(
         select(User).where(User.id == api_key.user_id)
     )
     user = result.scalar_one_or_none()
 
-    # Calculate estimated cost
+    # --- Permission check ---
+    enforce_user_can_call(api_key, agent)
+
+    # --- Quota check ---
     prompt_text = "\n".join([m.content for m in request.messages])
     prompt_tokens = await count_tokens(prompt_text)
     estimated_cost = (prompt_tokens / 1000) * (agent.pricing or 0.02)
 
-    # Check quota limits
     if api_key.quota_limit:
         if api_key.used_quota + estimated_cost > api_key.quota_limit:
             raise HTTPException(
@@ -132,11 +215,27 @@ async def chat_completions(
                 detail="API key quota exceeded"
             )
 
-    # Get agent engine
+    # ================================================================
+    # Pencil Agent branch — proxy to Gateway
+    # ================================================================
+    if is_pencil_agent(agent):
+        gateway = get_pencil_gateway()
+        body = request.model_dump(exclude_none=True)
+
+        return await gateway.proxy_chat(
+            request=raw_request,
+            body=body,
+            user=user,
+            agent=agent,
+        )
+
+    # ================================================================
+    # Built-in Agent branch — local AgentEngine
+    # ================================================================
     engine = get_agent_engine(agent_id)
 
     if request.stream:
-        # Streaming response
+        # --- Streaming response ---
         async def generate_stream():
             stream_completed = False
             try:
@@ -148,7 +247,7 @@ async def chat_completions(
                     yield {
                         "data": json.dumps(chunk, ensure_ascii=False)
                     }
-                    await asyncio.sleep(0)  # Yield control
+                    await asyncio.sleep(0)
                 yield {"data": "[DONE]"}
                 stream_completed = True
             except Exception as e:
@@ -161,7 +260,6 @@ async def chat_completions(
                     })
                 }
             finally:
-                # Only persist quota after stream completes successfully
                 if stream_completed:
                     latency_ms = int((time.time() - start_time) * 1000)
                     api_key.used_quota += estimated_cost
@@ -169,15 +267,13 @@ async def chat_completions(
                     await db.commit()
                     await db.refresh(api_key)
 
-        response = EventSourceResponse(
+        return EventSourceResponse(
             generate_stream(),
             media_type="text/event-stream"
         )
 
-        return response
-
     else:
-        # Non-streaming response
+        # --- Non-streaming response ---
         try:
             response = await engine.run(
                 messages=request.messages,
@@ -189,22 +285,13 @@ async def chat_completions(
             total_tokens = prompt_tokens + completion_tokens
             actual_cost = (total_tokens / 1000) * (agent.pricing or 0.02)
 
-            # Update quota
             api_key.used_quota += actual_cost
-
             latency_ms = int((time.time() - start_time) * 1000)
 
-            # Save usage log
             await save_usage_log(
-                db=db,
-                user=user,
-                api_key=api_key,
-                agent=agent,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                cost=actual_cost,
-                latency_ms=latency_ms,
-                status="success"
+                db=db, user=user, api_key=api_key, agent=agent,
+                prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+                cost=actual_cost, latency_ms=latency_ms, log_status="success"
             )
 
             return ChatCompletionResponse(
@@ -229,15 +316,9 @@ async def chat_completions(
         except Exception as e:
             latency_ms = int((time.time() - start_time) * 1000)
             await save_usage_log(
-                db=db,
-                user=user,
-                api_key=api_key,
-                agent=agent,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=0,
-                cost=0,
-                latency_ms=latency_ms,
-                status="error",
+                db=db, user=user, api_key=api_key, agent=agent,
+                prompt_tokens=prompt_tokens, completion_tokens=0,
+                cost=0, latency_ms=latency_ms, log_status="error",
                 error_message=str(e)
             )
             raise HTTPException(status_code=500, detail=str(e))

@@ -5,15 +5,19 @@ Unified Agent Integration Platform
 """
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy import select
 
 from app.config import settings
-from app.database import init_db, close_db
+from app.database import init_db, close_db, get_db
 from app.cache import init_cache, close_cache
 from app.middleware.rate_limit import rate_limit_middleware
 from app.routers import auth, agents, chat, console
+from app.services.pencil_gateway import PencilAgentBackend
+from app.auth import get_api_key_from_header
+from app.models import Agent, APIKey
 
 
 # Configure logging
@@ -33,6 +37,14 @@ async def lifespan(app: FastAPI):
     logger.info("Database initialized")
     await init_cache()
     logger.info("Cache initialized")
+
+    # Initialize Pencil Agent Gateway backend
+    if settings.pencil_gateway_internal_key:
+        gateway = PencilAgentBackend(settings)
+        chat.set_pencil_gateway(gateway)
+        logger.info("Pencil Agent Gateway backend initialized")
+    else:
+        logger.warning("PENCIL_GATEWAY_INTERNAL_KEY not set — pencil/* agents unavailable")
 
     yield
 
@@ -91,26 +103,34 @@ async def health_check():
     return {"status": "healthy", "version": "0.1.0"}
 
 
-# OpenAI compatibility info
+# OpenAI compatibility — models from DB
 @app.get("/v1/models")
-async def list_models():
-    """List available models (agents)"""
+async def list_models(
+    api_key: APIKey = Depends(get_api_key_from_header),
+    db=Depends(get_db)
+):
+    """
+    List available models (agents).
+
+    Returns all active, public agents from DB.
+    Includes both asgard/* built-in and pencil/* gateway agents.
+    """
+    result = await db.execute(
+        select(Agent).where(Agent.is_active == True, Agent.is_public == True)
+    )
+    agents_list = result.scalars().all()
+
     return {
         "object": "list",
         "data": [
             {
-                "id": "asgard/code-refactor",
+                "id": agent.agent_id,
                 "object": "model",
-                "created": 0,
-                "owned_by": "asgard"
-            },
-            {
-                "id": "asgard/hanhan-style",
-                "object": "model",
-                "created": 0,
-                "owned_by": "asgard"
+                "created": int(agent.created_at.timestamp()) if agent.created_at else 0,
+                "owned_by": "asgard",
             }
-        ]
+            for agent in agents_list
+        ],
     }
 
 
