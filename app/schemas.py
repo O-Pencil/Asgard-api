@@ -86,6 +86,30 @@ class AgentListResponse(BaseModel):
     total: int
 
 
+# ============ Pencil Agent Schemas ============
+
+class PencilAgentCreateRequest(BaseModel):
+    """Request body for creating a Pencil Agent instance."""
+    name: str = Field(..., description="Agent display name")
+    description: Optional[str] = None
+    category: str = "writing"
+    soul_prompt: Optional[str] = None
+    style_tags: Optional[List[str]] = None
+    memory_max_turns: int = Field(default=30, ge=1, le=200)
+    model_provider: Optional[str] = None
+    model_name: Optional[str] = None
+    is_public: bool = False
+
+
+class PencilAgentCreateResponse(BaseModel):
+    """Response after creating a Pencil Agent."""
+    agent_id: str
+    gateway_agent_id: str
+    name: str
+    status: str  # ready, error, syncing
+    created_at: datetime
+
+
 # ============ Chat Completion Schemas ============
 
 class Message(BaseModel):

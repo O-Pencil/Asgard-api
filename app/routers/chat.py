@@ -222,12 +222,38 @@ async def chat_completions(
         gateway = get_pencil_gateway()
         body = request.model_dump(exclude_none=True)
 
-        return await gateway.proxy_chat(
-            request=raw_request,
-            body=body,
-            user=user,
-            agent=agent,
-        )
+        # For non-streaming: record usage after response
+        # For streaming: record estimated usage (stream usage tracking is P1)
+        if not request.stream:
+            response = await gateway.proxy_chat(
+                request=raw_request,
+                body=body,
+                user=user,
+                agent=agent,
+            )
+            # Record usage for non-streaming pencil agent calls
+            latency_ms = int((time.time() - start_time) * 1000)
+            try:
+                await save_usage_log(
+                    db=db, user=user, api_key=api_key, agent=agent,
+                    prompt_tokens=prompt_tokens, completion_tokens=0,
+                    cost=estimated_cost, latency_ms=latency_ms, log_status="success"
+                )
+                # Update quota
+                api_key.used_quota += estimated_cost
+                db.add(api_key)
+                await db.commit()
+            except Exception as e:
+                logger.warning(f"Failed to record pencil agent usage: {e}")
+            return response
+        else:
+            # Streaming: proxy directly, usage tracked as estimated
+            return await gateway.proxy_chat(
+                request=raw_request,
+                body=body,
+                user=user,
+                agent=agent,
+            )
 
     # ================================================================
     # Built-in Agent branch — local AgentEngine

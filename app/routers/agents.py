@@ -1,5 +1,8 @@
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+import logging
+import uuid
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
@@ -7,7 +10,8 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.auth import get_current_user
 from app.models import Agent, User, APIKey
-from app.schemas import AgentResponse, AgentListResponse
+from app.schemas import AgentResponse, AgentListResponse, PencilAgentCreateRequest, PencilAgentCreateResponse
+from app.routers.chat import get_pencil_gateway
 
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
@@ -103,3 +107,93 @@ async def disable_agent(
     """Disable an agent for current user"""
     # Implementation similar to enable
     return {"status": "disabled", "agent_id": agent_id}
+
+
+@router.post("/pencil", response_model=PencilAgentCreateResponse, status_code=status.HTTP_201_CREATED)
+async def create_pencil_agent(
+    body: PencilAgentCreateRequest,
+    raw_request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Create a new Pencil Agent instance.
+
+    - Generates a gateway_agent_id from user uuid + name.
+    - Inserts Agent record with agent_id = pencil/<gateway_agent_id>.
+    - Calls Gateway POST /v1/agents to create the runtime instance.
+    - On Gateway failure, keeps the DB record with status=error for retry.
+    """
+    # Generate unique gateway agent ID
+    gateway_agent_id = f"asgard-u{current_user.id}-{uuid.uuid4().hex[:8]}"
+    agent_id = f"pencil/{gateway_agent_id}"
+
+    # Build parameters JSON
+    parameters = {
+        "agent_type": "pencil-agent",
+        "gateway_agent_id": gateway_agent_id,
+        "owner_user_id": current_user.id,
+        "soul": {
+            "systemPrompt": body.soul_prompt or f"你是{body.name}。",
+            "styleTags": body.style_tags or [],
+        },
+        "memory": {
+            "mode": "short-term",
+            "maxTurns": body.memory_max_turns,
+        },
+    }
+
+    # Add optional model config
+    if body.model_provider or body.model_name:
+        parameters["model"] = {}
+        if body.model_provider:
+            parameters["model"]["provider"] = body.model_provider
+        if body.model_name:
+            parameters["model"]["name"] = body.model_name
+
+    parameters["gateway_status"] = "syncing"
+
+    # Create Agent record in DB
+    agent = Agent(
+        agent_id=agent_id,
+        name=body.name,
+        description=body.description,
+        category=body.category,
+        capabilities=["pencil-agent"],
+        pricing=0.02,
+        parameters=parameters,
+        is_active=True,
+        is_public=body.is_public,
+    )
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
+
+    # Sync with Gateway
+    try:
+        gateway = get_pencil_gateway()
+        await gateway.create_agent(
+            request=raw_request,
+            user=current_user,
+            agent=agent,
+        )
+        parameters["gateway_status"] = "ready"
+        parameters["last_synced_at"] = datetime.utcnow().isoformat()
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Gateway sync failed: {e}")
+        parameters["gateway_status"] = "error"
+        parameters["gateway_error"] = str(e)
+
+    # Update parameters in DB
+    agent.parameters = parameters
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
+
+    return PencilAgentCreateResponse(
+        agent_id=agent_id,
+        gateway_agent_id=gateway_agent_id,
+        name=body.name,
+        status=parameters["gateway_status"],
+        created_at=agent.created_at,
+    )
