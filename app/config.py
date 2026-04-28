@@ -32,6 +32,12 @@ class Settings(BaseSettings):
     ollama_model: str = "qwen2.5"
     use_ollama: bool = True  # Set to False to use OpenAI API instead
 
+    # Pencil Agent Gateway
+    pencil_gateway_url: str = "http://pencil-gateway:8080"
+    pencil_gateway_internal_key: str = ""
+    pencil_gateway_connect_timeout_s: float = 5.0
+    pencil_gateway_read_timeout_s: Optional[float] = None
+
     # Logging
     log_level: str = "INFO"
 

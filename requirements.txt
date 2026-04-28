@@ -27,7 +27,9 @@ redis==5.0.1
 # OpenAI SDK (for compatibility)
 openai==1.10.0
 
+# HTTP Client (for Pencil Agent Gateway proxy)
+httpx==0.26.0
+
 # Testing
 pytest==7.4.4
 pytest-asyncio==0.23.3
-httpx==0.26.0
