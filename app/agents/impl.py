@@ -1,3 +1,9 @@
+"""
+[WHO]: Provides concrete agent implementations: CodeRefactorAgent, HanHanStyleAgent, BusinessCopywritingAgent, UnitTestAgent with specific system prompts
+[FROM]: Depends on app.agents.base.PromptTemplateAgent for base class, app.schemas.Message for message types
+[TO]: Consumed by routers/chat.py get_agent_engine() registry for agent instantiation
+[HERE]: packages/api/app/agents/impl.py - Agent implementation definitions; each agent has unique system prompt and specialized behavior
+"""
 from app.agents.base import PromptTemplateAgent
 
 

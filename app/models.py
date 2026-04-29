@@ -1,3 +1,9 @@
+"""
+[WHO]: Provides SQLAlchemy declarative models: User, APIKey, Agent, UsageLog, BalanceTransaction with relationships and constraints
+[FROM]: Depends on SQLAlchemy for ORM, uuid for UUID generation, datetime for timestamps
+[TO]: Consumed by database.py for table creation, routers for CRUD operations, services for business logic
+[HERE]: packages/api/app/models.py - Database schema definitions; core data model for multi-tenant agent management
+"""
 from datetime import datetime
 from typing import Optional, List
 from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, ForeignKey, JSON

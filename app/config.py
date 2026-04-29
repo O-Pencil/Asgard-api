@@ -1,3 +1,9 @@
+"""
+[WHO]: Provides Settings Pydantic model with lru_cache() singleton pattern for configuration management, loads from environment variables and .env file
+[FROM]: Depends on pydantic_settings for BaseSettings, functools.lru_cache for singleton
+[TO]: Consumed by all modules (main.py, auth.py, database.py, cache.py, routers) for accessing configuration values
+[HERE]: packages/api/app/config.py - Configuration management; singleton pattern ensures one Settings instance throughout application lifetime
+"""
 from functools import lru_cache
 from pydantic_settings import BaseSettings
 from typing import Optional

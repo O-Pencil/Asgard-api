@@ -1,3 +1,9 @@
+"""
+[WHO]: Provides abstract base classes: AgentEngine, PromptTemplateAgent, StructuredAgent defining agent execution contract
+[FROM]: Depends on app.schemas for Message type, app.llm.ollama for LLM provider, app.config for settings
+[TO]: Consumed by agents/impl.py for concrete implementations, routers/chat.py for agent execution
+[HERE]: packages/api/app/agents/base.py - Agent engine base classes; defines run() and run_streaming() interfaces with OpenAI-compatible streaming
+"""
 from abc import ABC, abstractmethod
 from typing import List, AsyncGenerator, Dict, Any
 from app.schemas import Message

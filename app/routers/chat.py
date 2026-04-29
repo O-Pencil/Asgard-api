@@ -1,10 +1,8 @@
 """
-Asgard Chat Completions Router
-
-[WHO]  Provides /v1/chat/completions endpoint with OpenAI-compatible API
-[FROM] Depends on app.services.pencil_gateway, app.agents, app.auth, app.models
-[TO]   Called by external clients (Cursor, VS Code, nanopencil-editor)
-[HERE] app/routers/chat.py within Asgard API backend
+[WHO]: Provides /v1/chat/completions endpoint with OpenAI-compatible API, streaming support, agent routing, usage logging
+[FROM]: Depends on app.services.pencil_gateway for pencil/* agents, app.agents.base for built-in agents, app.auth for authentication, app.models for DB models, app.schemas for request/response schemas
+[TO]: Called by external clients (Cursor, VS Code, nanopencil-editor) for chat completions
+[HERE]: packages/api/app/routers/chat.py - OpenAI-compatible chat endpoint; routes requests to built-in agents or Pencil Gateway based on agent_id
 """
 
 import json

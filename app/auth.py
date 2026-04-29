@@ -1,3 +1,9 @@
+"""
+[WHO]: Provides authentication utilities: password hashing, JWT token creation/decoding, API Key generation/hashing/validation, user authentication dependencies
+[FROM]: Depends on passlib for password hashing, jose for JWT tokens, hashlib for SHA256 hashing, secrets for secure random generation
+[TO]: Consumed by routers for protected endpoints, middleware for API key validation, main.py for authentication dependencies
+[HERE]: packages/api/app/auth.py - Authentication and authorization utilities; supports JWT tokens and API Keys with SHA256 hashing
+"""
 from datetime import datetime, timedelta
 from typing import Optional
 from passlib.context import CryptContext

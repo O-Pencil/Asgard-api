@@ -1,3 +1,9 @@
+"""
+[WHO]: Provides async SQLAlchemy engine, session maker, get_db() dependency for request-scoped sessions, init_db/close_db() for lifecycle management
+[FROM]: Depends on sqlalchemy.ext.asyncio for async engine and session, app.config.settings for database URL
+[TO]: Consumed by main.py for lifespan events, routers for database operations, models for table creation
+[HERE]: packages/api/app/database.py - Async database connection management; provides request-scoped sessions with automatic commit/rollback
+"""
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from app.config import settings

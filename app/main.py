@@ -1,4 +1,11 @@
 """
+[WHO]: Provides FastAPI application setup, CORS middleware, lifespan events, router inclusion, /v1/models endpoint for OpenAI compatibility
+[FROM]: Depends on FastAPI for web framework, SQLAlchemy for DB, Redis for cache, PencilAgentBackend for gateway integration
+[TO]: Consumed by uvicorn ASGI server for HTTP serving, routers for endpoint registration, middleware for request processing
+[HERE]: packages/api/app/main.py - FastAPI application entry point; orchestrates all components and serves as root router
+"""
+
+"""
 Asgard API - Main Application Entry Point
 
 Unified Agent Integration Platform
