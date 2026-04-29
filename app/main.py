@@ -117,15 +117,26 @@ async def list_models(
     db=Depends(get_db)
 ):
     """
-    List available models (agents).
+    List models visible to the calling api-key:
+      - All public, active agents (Marketplace).
+      - Plus the caller's own private PencilAgents (so editor / OpenAI clients
+        can address `pencil/<gateway_agent_id>` for the keys they actually own).
 
-    Returns all active, public agents from DB.
-    Includes both asgard/* built-in and pencil/* gateway agents.
+    Visibility filter runs in Python for cross-DB portability (Agent.parameters
+    is plain JSON; cheap at v0.1 user volume).
     """
-    result = await db.execute(
-        select(Agent).where(Agent.is_active == True, Agent.is_public == True)
-    )
-    agents_list = result.scalars().all()
+    result = await db.execute(select(Agent).where(Agent.is_active == True))
+    candidates = result.scalars().all()
+    user_id = str(api_key.user_id)
+
+    visible = [
+        a for a in candidates
+        if a.is_public
+        or (
+            (a.parameters or {}).get("agent_type") == "pencil-agent"
+            and str((a.parameters or {}).get("owner_user_id")) == user_id
+        )
+    ]
 
     return {
         "object": "list",
@@ -136,7 +147,7 @@ async def list_models(
                 "created": int(agent.created_at.timestamp()) if agent.created_at else 0,
                 "owned_by": "asgard",
             }
-            for agent in agents_list
+            for agent in visible
         ],
     }
 

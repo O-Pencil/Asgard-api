@@ -10,7 +10,14 @@ from sqlalchemy.orm import selectinload
 from app.database import get_db
 from app.auth import get_current_user
 from app.models import Agent, User, APIKey
-from app.schemas import AgentResponse, AgentListResponse, PencilAgentCreateRequest, PencilAgentCreateResponse
+from app.schemas import (
+    AgentResponse,
+    AgentListResponse,
+    PencilAgentCreateRequest,
+    PencilAgentCreateResponse,
+    PencilAgentDetail,
+    PencilAgentUpdateRequest,
+)
 from app.routers.chat import get_pencil_gateway
 
 
@@ -197,3 +204,164 @@ async def create_pencil_agent(
         status=parameters["gateway_status"],
         created_at=agent.created_at,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pencil Agent — list, detail, update
+# ---------------------------------------------------------------------------
+
+def _to_pencil_detail(agent: Agent) -> PencilAgentDetail:
+    """Project the JSON-blob parameters into a typed view for the UI."""
+    params = agent.parameters or {}
+    soul = params.get("soul") or {}
+    memory = params.get("memory") or {}
+    model = params.get("model") or {}
+    return PencilAgentDetail(
+        agent_id=agent.agent_id,
+        gateway_agent_id=params.get("gateway_agent_id", agent.agent_id.replace("pencil/", "")),
+        name=agent.name,
+        description=agent.description,
+        category=agent.category,
+        soul_prompt=soul.get("systemPrompt"),
+        style_tags=soul.get("styleTags") or [],
+        memory_max_turns=int(memory.get("maxTurns", 30)),
+        model_provider=model.get("provider"),
+        model_name=model.get("name"),
+        is_public=agent.is_public,
+        gateway_status=params.get("gateway_status"),
+        last_synced_at=params.get("last_synced_at"),
+        created_at=agent.created_at,
+        updated_at=getattr(agent, "updated_at", None),
+    )
+
+
+@router.get("/pencil/me", response_model=List[PencilAgentDetail])
+async def list_my_pencil_agents(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return all PencilAgents owned by the current user (private + public).
+
+    Separate from `GET /agents` (Marketplace) so the UI can render
+    "My Agents" without leaking other users' private prompts.
+    """
+    result = await db.execute(
+        select(Agent).where(
+            Agent.is_active == True,
+            Agent.agent_id.like("pencil/%"),
+        )
+    )
+    candidates = result.scalars().all()
+    user_id = str(current_user.id)
+    mine = [
+        a for a in candidates
+        if str((a.parameters or {}).get("owner_user_id")) == user_id
+    ]
+    return [_to_pencil_detail(a) for a in mine]
+
+
+@router.get("/pencil/{gateway_agent_id}", response_model=PencilAgentDetail)
+async def get_pencil_agent(
+    gateway_agent_id: str,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return a single PencilAgent owned by the caller."""
+    agent_id = f"pencil/{gateway_agent_id}"
+    result = await db.execute(select(Agent).where(Agent.agent_id == agent_id))
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="PencilAgent not found")
+    params = agent.parameters or {}
+    if str(params.get("owner_user_id")) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not your PencilAgent")
+    return _to_pencil_detail(agent)
+
+
+@router.put("/pencil/{gateway_agent_id}", response_model=PencilAgentDetail)
+async def update_pencil_agent(
+    gateway_agent_id: str,
+    body: PencilAgentUpdateRequest,
+    raw_request: Request,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Edit a PencilAgent's Soul / memory / model in place.
+
+    Routes to Gateway PUT /v1/agents/:id which keeps the running sessions —
+    user's open conversations don't lose history. Existing sessions retain
+    the Soul they were created with; new sessions see the update.
+    Frontend should surface that semantic to the user (see docs/12 §2.2).
+    """
+    agent_id = f"pencil/{gateway_agent_id}"
+    result = await db.execute(select(Agent).where(Agent.agent_id == agent_id))
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="PencilAgent not found")
+
+    params = dict(agent.parameters or {})
+    if str(params.get("owner_user_id")) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not your PencilAgent")
+
+    # Merge changes — only update fields the caller actually supplied.
+    soul = dict(params.get("soul") or {})
+    memory = dict(params.get("memory") or {"mode": "short-term", "maxTurns": 30})
+    model = dict(params.get("model") or {})
+
+    if body.soul_prompt is not None:
+        soul["systemPrompt"] = body.soul_prompt
+    if body.style_tags is not None:
+        soul["styleTags"] = body.style_tags
+    if body.memory_max_turns is not None:
+        memory["maxTurns"] = body.memory_max_turns
+    if body.model_provider is not None:
+        model["provider"] = body.model_provider
+    if body.model_name is not None:
+        model["name"] = body.model_name
+
+    params["soul"] = soul
+    params["memory"] = memory
+    if model:
+        params["model"] = model
+    params["gateway_status"] = "syncing"
+
+    if body.name is not None:
+        agent.name = body.name
+    if body.description is not None:
+        agent.description = body.description
+    if body.category is not None:
+        agent.category = body.category
+    if body.is_public is not None:
+        agent.is_public = body.is_public
+    agent.parameters = params
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
+
+    # Sync to Gateway (PUT — preserves sessions)
+    try:
+        gateway = get_pencil_gateway()
+        await gateway.update_agent(
+            request=raw_request,
+            user=current_user,
+            agent=agent,
+        )
+        params["gateway_status"] = "ready"
+        params["last_synced_at"] = datetime.utcnow().isoformat()
+        params.pop("gateway_error", None)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Gateway PUT sync failed: {e}")
+        params["gateway_status"] = "error"
+        params["gateway_error"] = str(e)
+        # Keep the DB updated so the user can retry; raise to surface the
+        # failure (HTTP 502 would be cleaner — leaving as-is for symmetry
+        # with create flow which also lets the exception bubble).
+
+    agent.parameters = params
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
+
+    return _to_pencil_detail(agent)

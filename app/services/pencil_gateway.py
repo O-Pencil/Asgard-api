@@ -104,6 +104,42 @@ class PencilAgentBackend:
         return res.json()
 
     # ------------------------------------------------------------------
+    # Update agent on Gateway (PUT — preserves running sessions)
+    # ------------------------------------------------------------------
+
+    async def update_agent(self, request: Request, user, agent) -> dict:
+        """
+        PUT /v1/agents/:id on Gateway. Differs from create_agent (POST):
+        Gateway keeps existing in-memory sessions, so the user's running chat
+        history survives a Soul/model edit.
+
+        New sessions created after the update see the new config; sessions
+        already open keep their captured Soul. UI should warn users that
+        starting a fresh conversation is required to fully apply the change.
+        """
+        params = agent.parameters or {}
+        gateway_agent_id = params.get("gateway_agent_id", agent.agent_id.replace("pencil/", ""))
+
+        body = {
+            "id": gateway_agent_id,
+            "name": agent.name,
+            "soul": params.get("soul") or {},
+            "memory": params.get("memory") or {"mode": "short-term", "maxTurns": 30},
+            "model": params.get("model") or {},
+            "engine": {"type": "nano-pencil"},
+        }
+
+        headers = self._build_headers(request, user, gateway_agent_id)
+
+        res = await self.client.put(
+            f"/v1/agents/{gateway_agent_id}",
+            json=body,
+            headers=headers,
+        )
+        res.raise_for_status()
+        return res.json()
+
+    # ------------------------------------------------------------------
     # Proxy chat completion
     # ------------------------------------------------------------------
 

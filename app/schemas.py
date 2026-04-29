@@ -101,6 +101,25 @@ class PencilAgentCreateRequest(BaseModel):
     is_public: bool = False
 
 
+class PencilAgentUpdateRequest(BaseModel):
+    """
+    Request body for editing a Pencil Agent in place.
+
+    All fields optional — only supplied keys are updated. The agent_id and
+    gateway_agent_id never change. Updates go to Gateway via PUT /v1/agents/:id
+    so existing chat sessions keep their conversation history.
+    """
+    name: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    soul_prompt: Optional[str] = None
+    style_tags: Optional[List[str]] = None
+    memory_max_turns: Optional[int] = Field(default=None, ge=1, le=200)
+    model_provider: Optional[str] = None
+    model_name: Optional[str] = None
+    is_public: Optional[bool] = None
+
+
 class PencilAgentCreateResponse(BaseModel):
     """Response after creating a Pencil Agent."""
     agent_id: str
@@ -108,6 +127,25 @@ class PencilAgentCreateResponse(BaseModel):
     name: str
     status: str  # ready, error, syncing
     created_at: datetime
+
+
+class PencilAgentDetail(BaseModel):
+    """Full detail of a user's PencilAgent (used by GET /pencil/me and PUT response)."""
+    agent_id: str
+    gateway_agent_id: str
+    name: str
+    description: Optional[str]
+    category: str
+    soul_prompt: Optional[str] = None
+    style_tags: List[str] = Field(default_factory=list)
+    memory_max_turns: int = 30
+    model_provider: Optional[str] = None
+    model_name: Optional[str] = None
+    is_public: bool
+    gateway_status: Optional[str] = None
+    last_synced_at: Optional[str] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 # ============ Chat Completion Schemas ============
