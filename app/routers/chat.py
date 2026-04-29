@@ -1,8 +1,8 @@
 """
 [WHO]: Provides /v1/chat/completions endpoint with OpenAI-compatible API, streaming support, agent routing, usage logging
 [FROM]: Depends on app.services.pencil_gateway for pencil/* agents, app.agents.base for built-in agents, app.auth for authentication, app.models for DB models, app.schemas for request/response schemas
-[TO]: Called by external clients (Cursor, VS Code, nanopencil-editor) for chat completions
-[HERE]: packages/api/app/routers/chat.py - OpenAI-compatible chat endpoint; routes requests to built-in agents or Pencil Gateway based on agent_id
+[TO]: Called by external clients (Cursor, VS Code, nanopencil-editor, Asgard Web) for chat completions
+[HERE]: packages/api/app/routers/chat.py - OpenAI-compatible chat endpoint; routes requests to built-in agents or Pencil Gateway based on agent_id; supports JWT auth in SINGLE_USER_MODE
 """
 
 import json
@@ -10,7 +10,7 @@ import time
 import asyncio
 import logging
 from datetime import datetime
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
@@ -19,7 +19,7 @@ from sqlalchemy import select
 from sse_starlette.sse import EventSourceResponse
 
 from app.database import get_db
-from app.auth import get_api_key_from_header, get_current_user
+from app.auth import get_user_and_apikey_for_chat
 from app.models import APIKey, User, Agent, UsageLog
 from app.schemas import ChatCompletionRequest, ChatCompletionResponse, Message
 from app.config import settings
@@ -70,9 +70,9 @@ def is_pencil_agent(agent: Agent) -> bool:
     )
 
 
-def enforce_user_can_call(api_key: APIKey, agent: Agent):
+def enforce_user_can_call(user: User, agent: Agent):
     """
-    Verify the API key owner is allowed to call this agent.
+    Verify the user is allowed to call this agent.
 
     - Public asgard/* agents: allowed for all authenticated users.
     - pencil/* agents: must match owner_user_id.
@@ -80,10 +80,10 @@ def enforce_user_can_call(api_key: APIKey, agent: Agent):
     params = agent.parameters or {}
     if params.get("agent_type") == "pencil-agent" or agent.agent_id.startswith("pencil/"):
         owner_user_id = params.get("owner_user_id")
-        if owner_user_id is not None and str(owner_user_id) != str(api_key.user_id):
+        if owner_user_id is not None and str(owner_user_id) != str(user.id):
             raise HTTPException(
                 status_code=403,
-                detail="Agent not allowed for this API key"
+                detail="Agent not allowed for this user"
             )
 
 
@@ -161,16 +161,18 @@ async def save_usage_log(
 async def chat_completions(
     request: ChatCompletionRequest,
     raw_request: Request,
-    api_key: APIKey = Depends(get_api_key_from_header),
+    auth_result: Tuple[User, APIKey] = Depends(get_user_and_apikey_for_chat),
     db: AsyncSession = Depends(get_db)
 ):
     """
     OpenAI-compatible Chat Completions endpoint.
 
+    Auth: accepts JWT Bearer (SINGLE_USER_MODE) or API Key Bearer.
     Routes to:
     - pencil/* agents  -> Pencil Agent Gateway (proxy)
     - asgard/* agents  -> Built-in AgentEngine (local)
     """
+    user, api_key = auth_result
     start_time = time.time()
 
     # --- Load agent from DB ---
@@ -192,14 +194,8 @@ async def chat_completions(
             detail=f"Agent '{agent_id}' is not available"
         )
 
-    # --- Load user ---
-    result = await db.execute(
-        select(User).where(User.id == api_key.user_id)
-    )
-    user = result.scalar_one_or_none()
-
     # --- Permission check ---
-    enforce_user_can_call(api_key, agent)
+    enforce_user_can_call(user, agent)
 
     # --- Quota check ---
     prompt_text = "\n".join([m.content for m in request.messages])

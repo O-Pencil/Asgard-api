@@ -7,7 +7,7 @@ from sqlalchemy.orm import selectinload
 from dateutil.relativedelta import relativedelta
 
 from app.database import get_db
-from app.auth import get_current_user, generate_api_key, hash_api_key
+from app.auth import get_user_from_jwt_or_apikey, generate_api_key, hash_api_key
 from app.models import User, APIKey, UsageLog, Agent, BalanceTransaction
 from app.schemas import (
     APIKeyResponse, APIKeyCreate, APIKeyCreateResponse,
@@ -20,7 +20,7 @@ router = APIRouter(prefix="/console", tags=["Developer Console"])
 
 @router.get("/keys", response_model=List[APIKeyResponse])
 async def list_api_keys(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """List all API keys for current user"""
@@ -34,7 +34,7 @@ async def list_api_keys(
 @router.post("/keys", response_model=APIKeyCreateResponse, status_code=status.HTTP_201_CREATED)
 async def create_api_key(
     key_data: APIKeyCreate = None,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """Create new API key"""
@@ -65,7 +65,7 @@ async def create_api_key(
 @router.delete("/keys/{key_uuid}")
 async def delete_api_key(
     key_uuid: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """Delete API key"""
@@ -89,7 +89,7 @@ async def delete_api_key(
 @router.post("/keys/{key_uuid}/rotate", response_model=APIKeyCreateResponse)
 async def rotate_api_key(
     key_uuid: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """Rotate (regenerate) API key"""
@@ -126,7 +126,7 @@ async def rotate_api_key(
 @router.get("/usage/stats", response_model=UsageStatsResponse)
 async def get_usage_stats(
     period: str = Query("week", regex="^(day|week|month)$"),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """Get usage statistics"""
@@ -200,7 +200,7 @@ async def get_usage_stats(
 async def get_usage_logs(
     limit: int = Query(50, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """Get usage logs"""
@@ -223,7 +223,7 @@ async def get_usage_logs(
 
 @router.get("/balance", response_model=BalanceResponse)
 async def get_balance(
-    current_user: User = Depends(get_current_user)
+    current_user: User = Depends(get_user_from_jwt_or_apikey)
 ):
     """Get current balance"""
     return {

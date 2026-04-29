@@ -11,8 +11,15 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 import uuid
 
+from app.config import settings
+
 
 Base = declarative_base()
+
+
+def table_name(name: str) -> str:
+    """Prefix Asgard tables so shared cloud databases avoid collisions."""
+    return f"{settings.db_table_prefix}{name}"
 
 
 def generate_uuid() -> str:
@@ -21,7 +28,7 @@ def generate_uuid() -> str:
 
 class User(Base):
     """用户表"""
-    __tablename__ = "users"
+    __tablename__ = table_name("users")
 
     id = Column(Integer, primary_key=True, index=True)
     uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
@@ -40,14 +47,14 @@ class User(Base):
 
 class APIKey(Base):
     """API Key 表"""
-    __tablename__ = "api_keys"
+    __tablename__ = table_name("api_keys")
 
     id = Column(Integer, primary_key=True, index=True)
     uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
     key_hash = Column(String(255), unique=True, index=True, nullable=False)  # 单向哈希存储
     key_prefix = Column(String(10), index=True)  # 前缀（用于识别）
     name = Column(String(255))
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey(f"{User.__tablename__}.id"), nullable=False)
     rate_limit = Column(Integer, default=60)  # 每分钟请求限制
     quota_limit = Column(Float, default=None)  # 额度上限（Credit）
     used_quota = Column(Float, default=0.0)  # 已使用额度
@@ -65,7 +72,7 @@ class APIKey(Base):
 
 class Agent(Base):
     """Agent 表"""
-    __tablename__ = "agents"
+    __tablename__ = table_name("agents")
 
     id = Column(Integer, primary_key=True, index=True)
     uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
@@ -89,13 +96,13 @@ class Agent(Base):
 
 class UsageLog(Base):
     """调用记录表"""
-    __tablename__ = "usage_logs"
+    __tablename__ = table_name("usage_logs")
 
     id = Column(Integer, primary_key=True, index=True)
     uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    api_key_id = Column(Integer, ForeignKey("api_keys.id"), nullable=False)
-    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey(f"{User.__tablename__}.id"), nullable=False)
+    api_key_id = Column(Integer, ForeignKey(f"{APIKey.__tablename__}.id"), nullable=False)
+    agent_id = Column(Integer, ForeignKey(f"{Agent.__tablename__}.id"), nullable=False)
 
     # 请求信息
     model = Column(String(100))  # asgard/xxx
@@ -123,11 +130,11 @@ class UsageLog(Base):
 
 class BalanceTransaction(Base):
     """余额记录表"""
-    __tablename__ = "balance_transactions"
+    __tablename__ = table_name("balance_transactions")
 
     id = Column(Integer, primary_key=True, index=True)
     uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey(f"{User.__tablename__}.id"), nullable=False)
     amount = Column(Float, nullable=False)  # 正数为充值，负数为扣费
     transaction_type = Column(String(50))  # deposit, usage, refund
     description = Column(Text)

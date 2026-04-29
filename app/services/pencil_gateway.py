@@ -140,6 +140,35 @@ class PencilAgentBackend:
         return res.json()
 
     # ------------------------------------------------------------------
+    # Delete agent on Gateway
+    # ------------------------------------------------------------------
+
+    async def delete_agent(self, request: Request, user, agent) -> dict:
+        """
+        DELETE /v1/agents/:id on Gateway.
+
+        A 404 from Gateway is treated as already gone, so Asgard can still
+        soft-delete its DB record and keep the user-facing lifecycle moving.
+        """
+        params = agent.parameters or {}
+        gateway_agent_id = params.get("gateway_agent_id", agent.agent_id.replace("pencil/", ""))
+        headers = self._build_headers(request, user, gateway_agent_id)
+
+        res = await self.client.delete(
+            f"/v1/agents/{gateway_agent_id}",
+            headers=headers,
+        )
+        if res.status_code == 404:
+            logger.warning(
+                "Gateway agent already missing during delete",
+                extra={"gateway_agent_id": gateway_agent_id},
+            )
+            return {"id": gateway_agent_id, "deleted": False, "missing": True}
+
+        res.raise_for_status()
+        return res.json()
+
+    # ------------------------------------------------------------------
     # Proxy chat completion
     # ------------------------------------------------------------------
 

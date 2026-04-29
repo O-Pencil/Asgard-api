@@ -8,7 +8,7 @@ from sqlalchemy import select, func
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.auth import get_current_user
+from app.auth import get_user_from_jwt_or_apikey
 from app.models import Agent, User, APIKey
 from app.schemas import (
     AgentResponse,
@@ -19,6 +19,7 @@ from app.schemas import (
     PencilAgentUpdateRequest,
 )
 from app.routers.chat import get_pencil_gateway
+from app.config import settings
 
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
@@ -30,7 +31,7 @@ async def list_agents(
     search: Optional[str] = None,
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """List all available agents"""
@@ -68,7 +69,7 @@ async def list_agents(
 @router.get("/{agent_id}", response_model=AgentResponse)
 async def get_agent(
     agent_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """Get agent details"""
@@ -89,7 +90,7 @@ async def get_agent(
 @router.post("/{agent_id}/enable")
 async def enable_agent(
     agent_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """Enable an agent for current user"""
@@ -108,7 +109,7 @@ async def enable_agent(
 @router.post("/{agent_id}/disable")
 async def disable_agent(
     agent_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """Disable an agent for current user"""
@@ -120,7 +121,7 @@ async def disable_agent(
 async def create_pencil_agent(
     body: PencilAgentCreateRequest,
     raw_request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -150,13 +151,16 @@ async def create_pencil_agent(
         },
     }
 
-    # Add optional model config
-    if body.model_provider or body.model_name:
+    # Add optional/default model config. Provider credentials stay in Gateway
+    # environment secrets; Asgard only sends provider/model names.
+    model_provider = body.model_provider or settings.pencil_default_provider
+    model_name = body.model_name or settings.pencil_default_model
+    if model_provider or model_name:
         parameters["model"] = {}
-        if body.model_provider:
-            parameters["model"]["provider"] = body.model_provider
-        if body.model_name:
-            parameters["model"]["name"] = body.model_name
+        if model_provider:
+            parameters["model"]["provider"] = model_provider
+        if model_name:
+            parameters["model"]["name"] = model_name
 
     parameters["gateway_status"] = "syncing"
 
@@ -237,7 +241,7 @@ def _to_pencil_detail(agent: Agent) -> PencilAgentDetail:
 
 @router.get("/pencil/me", response_model=List[PencilAgentDetail])
 async def list_my_pencil_agents(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -264,7 +268,7 @@ async def list_my_pencil_agents(
 @router.get("/pencil/{gateway_agent_id}", response_model=PencilAgentDetail)
 async def get_pencil_agent(
     gateway_agent_id: str,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db),
 ):
     """Return a single PencilAgent owned by the caller."""
@@ -284,7 +288,7 @@ async def update_pencil_agent(
     gateway_agent_id: str,
     body: PencilAgentUpdateRequest,
     raw_request: Request,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -365,3 +369,53 @@ async def update_pencil_agent(
     await db.refresh(agent)
 
     return _to_pencil_detail(agent)
+
+
+@router.delete("/pencil/{gateway_agent_id}")
+async def delete_pencil_agent(
+    gateway_agent_id: str,
+    raw_request: Request,
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Soft-delete a PencilAgent in Asgard and best-effort delete its Gateway
+    runtime instance.
+    """
+    agent_id = f"pencil/{gateway_agent_id}"
+    result = await db.execute(select(Agent).where(Agent.agent_id == agent_id))
+    agent = result.scalar_one_or_none()
+    if not agent or not agent.is_active:
+        raise HTTPException(status_code=404, detail="PencilAgent not found")
+
+    params = dict(agent.parameters or {})
+    if str(params.get("owner_user_id")) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not your PencilAgent")
+
+    gateway_deleted = True
+    try:
+        gateway = get_pencil_gateway()
+        await gateway.delete_agent(
+            request=raw_request,
+            user=current_user,
+            agent=agent,
+        )
+        params["gateway_status"] = "deleted"
+        params.pop("gateway_error", None)
+    except Exception as e:
+        gateway_deleted = False
+        logging.getLogger(__name__).error(f"Gateway DELETE sync failed: {e}")
+        params["gateway_status"] = "delete_error"
+        params["gateway_error"] = str(e)
+
+    agent.is_active = False
+    agent.parameters = params
+    db.add(agent)
+    await db.commit()
+
+    return {
+        "agent_id": agent.agent_id,
+        "gateway_agent_id": gateway_agent_id,
+        "deleted": True,
+        "gateway_deleted": gateway_deleted,
+    }

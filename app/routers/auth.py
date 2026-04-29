@@ -6,7 +6,7 @@ from datetime import timedelta
 from app.database import get_db
 from app.auth import (
     get_password_hash, verify_password, create_access_token,
-    get_current_user
+    get_user_from_jwt_or_apikey,
 )
 from app.models import User
 from app.schemas import UserCreate, UserResponse, Token
@@ -59,6 +59,6 @@ async def login(email: str, password: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_current_user_info(current_user: User = Depends(get_current_user)):
-    """Get current user info"""
+async def get_current_user_info(current_user: User = Depends(get_user_from_jwt_or_apikey)):
+    """Get current user info (supports JWT and API Key auth)"""
     return current_user
