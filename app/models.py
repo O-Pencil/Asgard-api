@@ -52,7 +52,7 @@ class APIKey(Base):
     id = Column(Integer, primary_key=True, index=True)
     uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
     key_hash = Column(String(255), unique=True, index=True, nullable=False)  # 单向哈希存储
-    key_prefix = Column(String(10), index=True)  # 前缀（用于识别）
+    key_prefix = Column(String(20), index=True)  # 前缀（用于识别）
     name = Column(String(255))
     user_id = Column(Integer, ForeignKey(f"{User.__tablename__}.id"), nullable=False)
     rate_limit = Column(Integer, default=60)  # 每分钟请求限制

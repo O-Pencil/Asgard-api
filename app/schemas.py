@@ -142,7 +142,9 @@ class PencilAgentDetail(BaseModel):
     model_provider: Optional[str] = None
     model_name: Optional[str] = None
     is_public: bool
-    gateway_status: Optional[str] = None
+    gateway_status: Optional[str] = None  # ready, error, syncing, delete_error
+    gateway_error: Optional[str] = None
+    retry_count: int = 0
     last_synced_at: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None

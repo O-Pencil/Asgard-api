@@ -20,6 +20,7 @@ from app.schemas import (
 )
 from app.routers.chat import get_pencil_gateway
 from app.config import settings
+from app.models_config import DEFAULT_MODEL_PROVIDERS
 
 
 router = APIRouter(prefix="/agents", tags=["Agents"])
@@ -233,6 +234,8 @@ def _to_pencil_detail(agent: Agent) -> PencilAgentDetail:
         model_name=model.get("name"),
         is_public=agent.is_public,
         gateway_status=params.get("gateway_status"),
+        gateway_error=params.get("gateway_error"),
+        retry_count=params.get("retry_count", 0),
         last_synced_at=params.get("last_synced_at"),
         created_at=agent.created_at,
         updated_at=getattr(agent, "updated_at", None),
@@ -263,6 +266,16 @@ async def list_my_pencil_agents(
         if str((a.parameters or {}).get("owner_user_id")) == user_id
     ]
     return [_to_pencil_detail(a) for a in mine]
+
+
+@router.get("/pencil/models", tags=["Agents"])
+async def list_model_providers():
+    """
+    Return the list of supported model providers and their models.
+    Data comes from DEFAULT_MODEL_PROVIDERS (embedded copy of nanopencil models.json).
+    When Asgard and Gateway are co-deployed, Gateway uses its own config at runtime.
+    """
+    return DEFAULT_MODEL_PROVIDERS
 
 
 @router.get("/pencil/{gateway_agent_id}", response_model=PencilAgentDetail)
@@ -362,6 +375,70 @@ async def update_pencil_agent(
         # Keep the DB updated so the user can retry; raise to surface the
         # failure (HTTP 502 would be cleaner — leaving as-is for symmetry
         # with create flow which also lets the exception bubble).
+
+    agent.parameters = params
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
+
+    return _to_pencil_detail(agent)
+
+
+@router.post("/pencil/{gateway_agent_id}/retry-sync")
+async def retry_sync_pencil_agent(
+    gateway_agent_id: str,
+    raw_request: Request,
+    current_user: User = Depends(get_user_from_jwt_or_apikey),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Retry syncing a PencilAgent to Gateway.
+    Resets gateway_status to 'syncing', calls Gateway POST /v1/agents,
+    then updates status to 'ready' or 'error'.
+    Increments retry_count on each attempt.
+    """
+    agent_id = f"pencil/{gateway_agent_id}"
+    result = await db.execute(select(Agent).where(Agent.agent_id == agent_id))
+    agent = result.scalar_one_or_none()
+    if not agent or not agent.is_active:
+        raise HTTPException(status_code=404, detail="PencilAgent not found")
+
+    params = dict(agent.parameters or {})
+    if str(params.get("owner_user_id")) != str(current_user.id):
+        raise HTTPException(status_code=403, detail="Not your PencilAgent")
+
+    # Only allow retry for error states
+    if params.get("gateway_status") not in ("error", "delete_error"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot retry-sync: current status is '{params.get('gateway_status')}', only 'error' or 'delete_error' can be retried"
+        )
+
+    # Increment retry count
+    params["retry_count"] = params.get("retry_count", 0) + 1
+    params["gateway_status"] = "syncing"
+    params.pop("gateway_error", None)
+
+    agent.parameters = params
+    db.add(agent)
+    await db.commit()
+    await db.refresh(agent)
+
+    # Sync to Gateway
+    try:
+        gateway = get_pencil_gateway()
+        await gateway.create_agent(
+            request=raw_request,
+            user=current_user,
+            agent=agent,
+        )
+        params["gateway_status"] = "ready"
+        params["last_synced_at"] = datetime.utcnow().isoformat()
+        params.pop("gateway_error", None)
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Gateway retry-sync failed: {e}")
+        params["gateway_status"] = "error"
+        params["gateway_error"] = str(e)
 
     agent.parameters = params
     db.add(agent)
