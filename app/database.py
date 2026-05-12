@@ -9,13 +9,19 @@ from sqlalchemy.orm import sessionmaker
 from app.config import settings
 
 
-engine = create_async_engine(
-    settings.database_url,
-    echo=settings.debug,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20,
-)
+# Pool args (pool_size / max_overflow) are Postgres-only — SQLite uses NullPool
+# and raises TypeError if pool config is passed. Detect the dialect so the same
+# settings.database_url works for both `postgresql+asyncpg://...` (prod) and
+# `sqlite+aiosqlite://...` (local demo / dev / single-machine deploy).
+_engine_kwargs: dict = {
+    "echo": settings.debug,
+    "pool_pre_ping": True,
+}
+if not settings.database_url.startswith("sqlite"):
+    _engine_kwargs["pool_size"] = 10
+    _engine_kwargs["max_overflow"] = 20
+
+engine = create_async_engine(settings.database_url, **_engine_kwargs)
 
 async_session = sessionmaker(
     engine,
