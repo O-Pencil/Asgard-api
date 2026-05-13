@@ -254,12 +254,20 @@ async def get_user_and_apikey_for_chat(
         raise HTTPException(status_code=401, detail="Invalid or missing credentials")
 
     # --- Resolve APIKey for this user ---
+    # When the request authenticated via JWT (UI / console flow), we still
+    # need an APIKey row to attribute usage. Pick the most recently created
+    # active key — using LIMIT 1 not scalar_one_or_none() because a user
+    # legitimately can have many active keys (multiple devices / service
+    # integrations) and crashing on that is wrong.
     if api_key is None:
         result = await db.execute(
-            select(APIKey).where(
+            select(APIKey)
+            .where(
                 APIKey.user_id == user.id,
                 APIKey.is_active == True,
             )
+            .order_by(APIKey.created_at.desc())
+            .limit(1)
         )
         api_key = result.scalar_one_or_none()
 
