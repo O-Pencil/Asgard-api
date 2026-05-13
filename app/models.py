@@ -87,6 +87,22 @@ class Agent(Base):
     is_active = Column(Boolean, default=True)
     is_public = Column(Boolean, default=True)  # 是否公开
     version = Column(String(20), default="1.0.0")
+
+    # ─── P1 (doc 16 §7.5): Agent 三种形态分类 ─────────────────────────────
+    # super     : 平台 / 厂商分发的 immutable SuperAgent（出现在"市场"列表）
+    # derived   : 用户从某个 super 派生出的个性化版本（parent_template_id 指向 super）
+    # custom    : 用户从零自创（无 parent）
+    kind = Column(String(16), default="custom", nullable=False, index=True)
+
+    # 当 kind=derived 时，指向其父 SuperAgent 的 id（self-ref FK，但用 Integer
+    # 而非 ForeignKey 以避免循环引用复杂性 — 应用层校验）。
+    parent_template_id = Column(Integer, nullable=True, index=True)
+
+    # immutable    : Soul 不可被本地用户修改（super 默认；强制由 Gateway 端执行）
+    # overridable  : 可被本地用户调整（derived / custom 默认）
+    soul_policy = Column(String(16), default="overridable", nullable=False)
+    # ──────────────────────────────────────────────────────────────────
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

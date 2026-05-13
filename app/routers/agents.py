@@ -133,6 +133,23 @@ async def create_pencil_agent(
     - Calls Gateway POST /v1/agents to create the runtime instance.
     - On Gateway failure, keeps the DB record with status=error for retry.
     """
+    # doc 16 §7.5 — only 'custom' is creatable via this generic endpoint.
+    # 'super' templates are seeded by ops; 'derived' goes through the
+    # dedicated /pencil/<super_id>/derive flow (P2). Reject anything else
+    # up-front so we don't silently downgrade caller intent.
+    requested_kind = (body.kind or "custom").lower()
+    if requested_kind != "custom":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"kind='{requested_kind}' is not creatable via POST /agents/pencil. "
+                "Use POST /agents/pencil/{super_id}/derive for derived agents; "
+                "super templates are provisioned out-of-band."
+            ),
+        )
+    # 'custom' agents always start with overridable soul (user owns the prompt).
+    soul_policy = "overridable"
+
     # Generate unique gateway agent ID
     gateway_agent_id = f"asgard-u{current_user.id}-{uuid.uuid4().hex[:8]}"
     agent_id = f"pencil/{gateway_agent_id}"
@@ -176,6 +193,9 @@ async def create_pencil_agent(
         parameters=parameters,
         is_active=True,
         is_public=body.is_public,
+        kind=requested_kind,
+        parent_template_id=None,
+        soul_policy=soul_policy,
     )
     db.add(agent)
     await db.commit()
@@ -233,6 +253,12 @@ def _to_pencil_detail(agent: Agent) -> PencilAgentDetail:
         model_provider=model.get("provider"),
         model_name=model.get("name"),
         is_public=agent.is_public,
+        # doc 16 §7.5 — getattr() with defaults keeps the projection working
+        # for agents created before the schema migration (they still read as
+        # custom/overridable, matching their pre-classification semantics).
+        kind=getattr(agent, "kind", None) or "custom",
+        parent_template_id=getattr(agent, "parent_template_id", None),
+        soul_policy=getattr(agent, "soul_policy", None) or "overridable",
         gateway_status=params.get("gateway_status"),
         gateway_error=params.get("gateway_error"),
         retry_count=params.get("retry_count", 0),

@@ -99,6 +99,13 @@ class PencilAgentCreateRequest(BaseModel):
     model_provider: Optional[str] = None
     model_name: Optional[str] = None
     is_public: bool = False
+    # doc 16 §7.5 — Agent classification.
+    # `kind` defaults to 'custom' for user-from-scratch agents. Platform
+    # operators create 'super' templates out-of-band; 'derived' agents are
+    # produced by the dedicated POST /pencil/<super_id>/derive endpoint (P2),
+    # not through this generic create — so we deliberately accept only
+    # 'custom' here. Validation lives in the router.
+    kind: Optional[str] = Field(default="custom", description="super | derived | custom (only 'custom' allowed via this endpoint)")
 
 
 class PencilAgentUpdateRequest(BaseModel):
@@ -118,6 +125,10 @@ class PencilAgentUpdateRequest(BaseModel):
     model_provider: Optional[str] = None
     model_name: Optional[str] = None
     is_public: Optional[bool] = None
+    # `kind` / `parent_template_id` / `soul_policy` are intentionally NOT
+    # editable through this endpoint — changing them after creation breaks
+    # the super→derived lineage invariants. Use the dedicated lifecycle
+    # endpoints (P2 derive, P5 super version bumps) instead.
 
 
 class PencilAgentCreateResponse(BaseModel):
@@ -142,6 +153,12 @@ class PencilAgentDetail(BaseModel):
     model_provider: Optional[str] = None
     model_name: Optional[str] = None
     is_public: bool
+    # doc 16 §7.5 — surfaced to the UI so it can render the right affordances
+    # (e.g. lock the Soul editor when kind=super / soul_policy=immutable, show
+    # a "derived from X" badge when parent_template_id is set).
+    kind: str = "custom"
+    parent_template_id: Optional[int] = None
+    soul_policy: str = "overridable"
     gateway_status: Optional[str] = None  # ready, error, syncing, delete_error
     gateway_error: Optional[str] = None
     retry_count: int = 0

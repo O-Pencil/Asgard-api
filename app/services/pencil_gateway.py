@@ -91,7 +91,21 @@ class PencilAgentBackend:
             "memory": params.get("memory") or {"mode": "short-term", "maxTurns": 30},
             "model": params.get("model") or {},
             "engine": {"type": "nano-pencil"},
+            # doc 16 §7.5 — tell Gateway what kind of agent this is so its
+            # registry can write the right `kind` into <agentDir>/agent.json.
+            # `origin` carries the Asgard-side identity for traceability
+            # (P3 soul-policy enforcement uses `kind`; nanoPencil CLI / future
+            # tooling reads `origin` to know "where did this pencil come from").
+            "kind": getattr(agent, "kind", None) or "custom",
+            "origin": {
+                "type": "asgard",
+                "asgardAgentId": agent.agent_id,
+                "ownerUserUuid": str(user.uuid),
+            },
         }
+        parent_id = getattr(agent, "parent_template_id", None)
+        if parent_id is not None:
+            body["parentTemplateId"] = parent_id
 
         headers = self._build_headers(request, user, gateway_agent_id)
 
@@ -127,7 +141,16 @@ class PencilAgentBackend:
             "memory": params.get("memory") or {"mode": "short-term", "maxTurns": 30},
             "model": params.get("model") or {},
             "engine": {"type": "nano-pencil"},
+            "kind": getattr(agent, "kind", None) or "custom",
+            "origin": {
+                "type": "asgard",
+                "asgardAgentId": agent.agent_id,
+                "ownerUserUuid": str(user.uuid),
+            },
         }
+        parent_id = getattr(agent, "parent_template_id", None)
+        if parent_id is not None:
+            body["parentTemplateId"] = parent_id
 
         headers = self._build_headers(request, user, gateway_agent_id)
 
