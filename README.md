@@ -2,6 +2,8 @@
 
 Unified Agent Integration Platform - Backend Service
 
+> **Pencil 生态定位**：本仓是 Pencil 生态 4 项目之一（Asgard Platform 的 API 实现层）。生态级事实（4 项目拓扑、术语、阶段、跨项目工作线/决策）以 [nanoPencil platform charter](https://github.com/O-Pencil/nanoPencil/blob/main/docs/pencil-platform-charter.md) 为唯一源头；本仓 charter pointer 见 [docs/PENCIL-CHARTER-POINTER.md](./docs/PENCIL-CHARTER-POINTER.md)。
+
 ## Tech Stack
 
 - **Framework**: FastAPI (Python 3.11+)
