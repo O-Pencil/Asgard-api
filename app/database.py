@@ -1,13 +1,16 @@
 """
 [WHO]: Provides async SQLAlchemy engine, session maker, get_db() dependency for request-scoped sessions, init_db/close_db() for lifecycle management
-[FROM]: Depends on sqlalchemy.ext.asyncio for async engine and session, app.config.settings for database URL
+[FROM]: Depends on sqlalchemy.ext.asyncio for async engine and session, sqlalchemy.engine for database URL normalization, app.config.settings for database URL
 [TO]: Consumed by main.py for lifespan events, routers for database operations, models for table creation
 [HERE]: packages/api/app/database.py - Async database connection management; provides request-scoped sessions with automatic commit/rollback
 """
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 from app.config import settings
 
+
+_database_url = make_url(settings.database_url)
 
 # Pool args (pool_size / max_overflow) are Postgres-only — SQLite uses NullPool
 # and raises TypeError if pool config is passed. Detect the dialect so the same
@@ -20,8 +23,16 @@ _engine_kwargs: dict = {
 if not settings.database_url.startswith("sqlite"):
     _engine_kwargs["pool_size"] = 10
     _engine_kwargs["max_overflow"] = 20
+    # Some managed Postgres providers expose URLs with `sslmode=require`.
+    # SQLAlchemy forwards query params to asyncpg, whose connect() accepts
+    # `ssl=True` instead of `sslmode=...`, so translate it at the engine boundary.
+    sslmode = _database_url.query.get("sslmode")
+    if sslmode:
+        _database_url = _database_url.difference_update_query(["sslmode"])
+        if sslmode not in {"disable", "allow", "prefer"}:
+            _engine_kwargs["connect_args"] = {"ssl": True}
 
-engine = create_async_engine(settings.database_url, **_engine_kwargs)
+engine = create_async_engine(_database_url, **_engine_kwargs)
 
 async_session = sessionmaker(
     engine,
