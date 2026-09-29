@@ -1,5 +1,5 @@
 """
-[WHO]: Provides FastAPI application setup, CORS middleware, lifespan events, router inclusion, /v1/models endpoint for OpenAI compatibility
+[WHO]: Provides FastAPI application setup, CORS middleware, lifespan events, router inclusion, /v1/models endpoint for OpenAI compatibility, billing routes for Catea Pro
 [FROM]: Depends on FastAPI for web framework, SQLAlchemy for DB, Redis for cache, PencilAgentBackend for gateway integration
 [TO]: Consumed by uvicorn ASGI server for HTTP serving, routers for endpoint registration, middleware for request processing
 [HERE]: packages/api/app/main.py - FastAPI application entry point; orchestrates all components and serves as root router
@@ -21,7 +21,7 @@ from app.config import settings
 from app.database import init_db, close_db, get_db
 from app.cache import init_cache, close_cache
 from app.middleware.rate_limit import rate_limit_middleware
-from app.routers import auth, agents, chat, console
+from app.routers import auth, agents, chat, console, billing
 from app.services.pencil_gateway import PencilAgentBackend
 from app.auth import (
     get_user_from_jwt_or_apikey,
@@ -232,6 +232,7 @@ app.include_router(auth.router, prefix="/api/v1")
 app.include_router(agents.router, prefix="/api/v1")
 app.include_router(console.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/v1")
+app.include_router(billing.router, prefix="/billing")
 
 
 if __name__ == "__main__":

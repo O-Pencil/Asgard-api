@@ -1,12 +1,12 @@
 """
-[WHO]: Provides SQLAlchemy declarative models: User, APIKey, Agent, UsageLog, BalanceTransaction with relationships and constraints
+[WHO]: Provides SQLAlchemy declarative models: User, APIKey, Agent, UsageLog, BalanceTransaction, BillingCustomer, BillingSubscription, BillingWebhookEvent with relationships and constraints
 [FROM]: Depends on SQLAlchemy for ORM, uuid for UUID generation, datetime for timestamps
 [TO]: Consumed by database.py for table creation, routers for CRUD operations, services for business logic
 [HERE]: packages/api/app/models.py - Database schema definitions; core data model for multi-tenant agent management
 """
 from datetime import datetime
 from typing import Optional, List
-from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, ForeignKey, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, ForeignKey, JSON, UniqueConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 import uuid
@@ -155,3 +155,66 @@ class BalanceTransaction(Base):
     transaction_type = Column(String(50))  # deposit, usage, refund
     description = Column(Text)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class BillingCustomer(Base):
+    """Billing customer keyed by email/license identity for Catea Pro."""
+    __tablename__ = table_name("billing_customers")
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
+    email = Column(String(255), unique=True, index=True, nullable=False)
+    provider = Column(String(32), default="creem", nullable=False, index=True)
+    provider_customer_id = Column(String(128), index=True)
+    license_key = Column(String(64), unique=True, index=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    subscriptions = relationship("BillingSubscription", back_populates="customer")
+
+
+class BillingSubscription(Base):
+    """Provider subscription state used to decide whether Catea Pro is active."""
+    __tablename__ = table_name("billing_subscriptions")
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_subscription_id", name="uq_billing_provider_subscription"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
+    customer_id = Column(Integer, ForeignKey(f"{BillingCustomer.__tablename__}.id"), nullable=False)
+    provider = Column(String(32), default="creem", nullable=False, index=True)
+    provider_subscription_id = Column(String(128), nullable=False, index=True)
+    provider_order_id = Column(String(128), index=True)
+    provider_checkout_id = Column(String(128), index=True)
+    product_id = Column(String(128), index=True)
+    plan = Column(String(64), nullable=False, index=True)
+    status = Column(String(64), nullable=False, index=True)
+    active = Column(Boolean, default=False, nullable=False, index=True)
+    current_period_start = Column(DateTime)
+    current_period_end = Column(DateTime)
+    canceled_at = Column(DateTime)
+    provider_metadata = Column("metadata", JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer = relationship("BillingCustomer", back_populates="subscriptions")
+
+
+class BillingWebhookEvent(Base):
+    """Processed billing webhook deliveries for idempotency and debugging."""
+    __tablename__ = table_name("billing_webhook_events")
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_billing_provider_event"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
+    provider = Column(String(32), default="creem", nullable=False, index=True)
+    provider_event_id = Column(String(128), nullable=False, index=True)
+    event_type = Column(String(128), nullable=False, index=True)
+    processed = Column(Boolean, default=False, nullable=False)
+    payload = Column(JSON, default=dict)
+    error_message = Column(Text)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    processed_at = Column(DateTime)

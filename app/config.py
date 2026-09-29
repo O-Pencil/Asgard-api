@@ -49,6 +49,16 @@ class Settings(BaseSettings):
     pencil_default_provider: Optional[str] = None
     pencil_default_model: Optional[str] = None
 
+    # Creem billing for Catea Pro
+    creem_api_key: str = ""
+    creem_api_base: str = "https://test-api.creem.io"
+    creem_environment: str = "test"
+    creem_product_id_pro_monthly: str = ""
+    creem_product_id_pro_yearly: str = ""
+    creem_webhook_id: str = ""
+    creem_webhook_secret: str = ""
+    catea_billing_success_url: str = "https://asgard-api-utj6.onrender.com/billing/success"
+
     # Single-user hosted preview mode. This only controls deployment/runtime
     # behavior; production auth hardening should stay separate.
     single_user_mode: bool = False
