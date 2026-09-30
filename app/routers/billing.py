@@ -37,7 +37,6 @@ from app.models import (
 from app.schemas import (
     BillingCheckoutRequest,
     BillingCheckoutResponse,
-    ChatCompletionRequest,
     BillingLicenseStatusResponse,
 )
 
@@ -302,6 +301,19 @@ async def _get_active_hosted_customer(
 
 
 def _message_text(message: Any) -> str:
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts)
+        return ""
     content = getattr(message, "content", None)
     if isinstance(content, str):
         return content
@@ -363,8 +375,8 @@ def _hosted_model_url() -> str:
     return f"{settings.catea_hosted_model_base_url.rstrip('/')}/chat/completions"
 
 
-def _hosted_model_body(request: ChatCompletionRequest) -> dict[str, Any]:
-    body = request.model_dump(exclude_none=True)
+def _hosted_model_body(request: dict[str, Any]) -> dict[str, Any]:
+    body = dict(request)
     body["model"] = settings.catea_hosted_model_name
     if settings.catea_hosted_model_reasoning_effort:
         body.setdefault("reasoning_effort", settings.catea_hosted_model_reasoning_effort)
@@ -675,7 +687,7 @@ async def license_status(
 
 @router.post("/hosted/v1/chat/completions")
 async def hosted_chat_completions(
-    payload: ChatCompletionRequest,
+    request: Request,
     authorization: Optional[str] = Header(default=None),
     db: AsyncSession = Depends(get_db),
 ):
@@ -687,8 +699,17 @@ async def hosted_chat_completions(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Catea Pro license is required")
 
     customer, _, _, period, window = await _get_active_hosted_customer(db, license_key)
+    try:
+        payload = await request.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="messages must be an array")
     request_id = "hosted_" + secrets.token_urlsafe(24)
-    prompt_tokens = _estimate_tokens_from_messages(payload.messages)
+    prompt_tokens = _estimate_tokens_from_messages(messages)
     outbound_body = _hosted_model_body(payload)
     headers = {
         "Authorization": f"Bearer {settings.catea_hosted_model_api_key}",
@@ -696,7 +717,7 @@ async def hosted_chat_completions(
     }
 
     timeout = httpx.Timeout(settings.catea_hosted_model_timeout_s, connect=20.0)
-    if payload.stream:
+    if payload.get("stream") is True:
         async def generate_stream():
             output_chars = 0
             completed = False
