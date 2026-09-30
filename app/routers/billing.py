@@ -81,7 +81,7 @@ def _plan_for_product(product_id: Optional[str]) -> str:
 
 
 def _product_for_plan(plan: str, currency: str = "USD") -> str:
-    if currency == "CNY":
+    if currency == "CNY" and settings.creem_product_id_pro_monthly_cny:
         return settings.creem_product_id_pro_monthly_cny
     return settings.creem_product_id_pro_monthly
 
@@ -359,6 +359,11 @@ async def create_creem_checkout(
             status_code=500,
             detail=f"Creem product for plan '{payload.plan}' and currency '{payload.currency}' is not configured",
         )
+    checkout_currency = (
+        payload.currency
+        if payload.currency != "CNY" or settings.creem_product_id_pro_monthly_cny
+        else "USD"
+    )
 
     customer = await _get_or_create_customer(db, payload.email)
     success_url = payload.success_url or settings.catea_billing_success_url
@@ -374,7 +379,8 @@ async def create_creem_checkout(
             "email": customer.email,
             "licenseKey": customer.license_key,
             "plan": PRO_PLAN_ID,
-            "currency": payload.currency,
+            "currency": checkout_currency,
+            "requestedCurrency": payload.currency,
             "source": "catea",
         },
     }
