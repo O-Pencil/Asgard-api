@@ -16,7 +16,7 @@ auth.py: Authentication endpoints: POST /api/v1/auth/register (user creation wit
 
 agents.py: Agent management endpoints: GET /api/v1/agents (list all active agents), GET /api/v1/agents/{id} (agent details), POST /api/v1/agents/enable (activate agent), POST /api/v1/agents/disable (deactivate agent), admin controls with Depends(get_api_key_from_header)
 
-billing.py: Catea Pro billing endpoints: POST /billing/creem/checkout (create Creem test checkout), POST /billing/creem/webhook (verify Creem HMAC and fulfill events), GET /billing/license/status (return BYOK model limits), GET /billing/success (checkout redirect page)
+billing.py: Catea Pro billing endpoints: POST /billing/creem/checkout (create Creem checkout), POST /billing/creem/webhook (verify Creem HMAC and fulfill events), GET /billing/license/status and GET /billing/me (return plan, license and quota status), POST /billing/hosted/v1/chat/completions (OpenAI-compatible Pro hosted model proxy with quota enforcement), GET /billing/success (checkout redirect page)
 
 chat.py: OpenAI-compatible chat endpoint: POST /v1/chat/completions (supports stream=true for SSE streaming), get_agent_engine() registry maps agent_id (asgard/xxx, pencil/xxx) to AgentEngine implementations, usage logging for token tracking and cost calculation
 

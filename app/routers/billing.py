@@ -1,11 +1,12 @@
 """
-[WHO]: Provides billing router for Creem checkout creation, webhook fulfillment, license status lookup, and payment success response
-[FROM]: Depends on FastAPI request handling, SQLAlchemy async sessions, httpx for Creem API calls, hmac/hashlib for webhook signature verification, app.config settings, app.models billing tables, app.schemas billing DTOs
+[WHO]: Provides billing router for Creem checkout creation, webhook fulfillment, license status lookup, hosted model proxy, and payment success response
+[FROM]: Depends on FastAPI request handling, SQLAlchemy async sessions, httpx for Creem and hosted model API calls, hmac/hashlib for webhook signature verification, app.config settings, app.models billing tables, app.schemas billing DTOs
 [TO]: Consumed by main.py as /billing routes for Catea Pro payment and entitlement testing
-[HERE]: packages/api/app/routers/billing.py - Creem-backed Catea Pro billing integration; maps successful subscription events to local hosted-usage entitlements
+[HERE]: packages/api/app/routers/billing.py - Creem-backed Catea Pro billing integration; maps successful subscription events to local hosted-usage entitlements and enforces hosted model quota
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -14,11 +15,12 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import get_password_hash
 from app.config import settings
 from app.database import get_db
 from app.models import (
@@ -26,13 +28,16 @@ from app.models import (
     BillingPlan,
     BillingPrice,
     BillingSubscription,
+    BillingUsageEvent,
     BillingUsagePeriod,
     BillingUsageWindow,
     BillingWebhookEvent,
+    User,
 )
 from app.schemas import (
     BillingCheckoutRequest,
     BillingCheckoutResponse,
+    ChatCompletionRequest,
     BillingLicenseStatusResponse,
 )
 
@@ -63,6 +68,15 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
 
 def _normalize_email(email: str) -> str:
     return email.strip().lower()
+
+
+def _bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
 
 
 PRO_PLAN_ID = "pro_monthly"
@@ -128,6 +142,24 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
     return plan
 
 
+async def _ensure_billing_user(db: AsyncSession, email: str) -> User:
+    normalized_email = _normalize_email(email)
+    result = await db.execute(select(User).where(User.email == normalized_email))
+    user = result.scalar_one_or_none()
+    if user:
+        return user
+    user = User(
+        email=normalized_email,
+        hashed_password=get_password_hash(secrets.token_urlsafe(32)),
+        full_name="Catea billing user",
+        balance=0.0,
+        is_active=True,
+    )
+    db.add(user)
+    await db.flush()
+    return user
+
+
 def _percent(used: int, included: int) -> dict[str, Any]:
     if included <= 0:
         return {"used_percent": 0, "remaining_percent": 0}
@@ -141,6 +173,24 @@ async def _quota_for_subscription(
     subscription: Optional[BillingSubscription],
     plan: BillingPlan,
 ) -> dict[str, Any]:
+    period, window = await _ensure_usage_buckets(db, customer, subscription, plan)
+    monthly = _percent(period.used_credits, period.included_credits)
+    monthly["reset_at"] = period.period_end
+    monthly["included_credits"] = period.included_credits
+    monthly["used_credits"] = period.used_credits
+    window_quota = _percent(window.used_credits, window.included_credits)
+    window_quota["reset_at"] = window.window_end
+    window_quota["included_credits"] = window.included_credits
+    window_quota["used_credits"] = window.used_credits
+    return {"monthly": monthly, "window": window_quota}
+
+
+async def _ensure_usage_buckets(
+    db: AsyncSession,
+    customer: BillingCustomer,
+    subscription: Optional[BillingSubscription],
+    plan: BillingPlan,
+) -> tuple[BillingUsagePeriod, BillingUsageWindow]:
     now = _now()
     period_start = subscription.current_period_start if subscription and subscription.current_period_start else now
     period_end = (
@@ -193,16 +243,7 @@ async def _quota_for_subscription(
         )
         db.add(window)
     await db.flush()
-
-    monthly = _percent(period.used_credits, period.included_credits)
-    monthly["reset_at"] = period.period_end
-    monthly["included_credits"] = period.included_credits
-    monthly["used_credits"] = period.used_credits
-    window_quota = _percent(window.used_credits, window.included_credits)
-    window_quota["reset_at"] = window.window_end
-    window_quota["included_credits"] = window.included_credits
-    window_quota["used_credits"] = window.used_credits
-    return {"monthly": monthly, "window": window_quota}
+    return period, window
 
 
 async def _get_or_create_customer(
@@ -226,6 +267,7 @@ async def _get_or_create_customer(
         license_key="catea_" + secrets.token_urlsafe(24),
     )
     db.add(customer)
+    await _ensure_billing_user(db, normalized_email)
     await db.flush()
     return customer
 
@@ -237,6 +279,96 @@ async def _get_subscription_status(db: AsyncSession, customer: BillingCustomer) 
         .order_by(BillingSubscription.updated_at.desc())
     )
     return result.scalars().first()
+
+
+async def _get_active_hosted_customer(
+    db: AsyncSession,
+    license_key: str,
+) -> tuple[BillingCustomer, BillingSubscription, BillingPlan, BillingUsagePeriod, BillingUsageWindow]:
+    result = await db.execute(select(BillingCustomer).where(BillingCustomer.license_key == license_key))
+    customer = result.scalar_one_or_none()
+    if not customer:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Catea Pro license")
+    subscription = await _get_subscription_status(db, customer)
+    if not subscription or not subscription.active:
+        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Catea Pro subscription is required")
+    plan = await _ensure_pro_plan(db)
+    period, window = await _ensure_usage_buckets(db, customer, subscription, plan)
+    if period.used_credits >= period.included_credits:
+        raise HTTPException(status_code=429, detail="Monthly hosted model quota exceeded")
+    if window.used_credits >= window.included_credits:
+        raise HTTPException(status_code=429, detail="Hosted model quota will reset soon")
+    return customer, subscription, plan, period, window
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def _estimate_tokens_from_messages(messages: list[Any]) -> int:
+    text = "\n".join(_message_text(message) for message in messages)
+    return max(1, len(text) // 4)
+
+
+def _usage_tokens(payload: dict[str, Any], fallback: int) -> tuple[int, int, int]:
+    usage = payload.get("usage") if isinstance(payload, dict) else None
+    if not isinstance(usage, dict):
+        return fallback, 0, fallback
+    prompt = int(usage.get("prompt_tokens") or 0)
+    completion = int(usage.get("completion_tokens") or 0)
+    total = int(usage.get("total_tokens") or prompt + completion or fallback)
+    return prompt or fallback, completion, total
+
+
+async def _record_hosted_usage(
+    db: AsyncSession,
+    customer: BillingCustomer,
+    period: BillingUsagePeriod,
+    window: BillingUsageWindow,
+    request_id: str,
+    model_route: str,
+    input_tokens: int,
+    output_tokens: int,
+    credits: int,
+) -> None:
+    safe_credits = max(1, credits)
+    event = BillingUsageEvent(
+        customer_id=customer.id,
+        request_id=request_id,
+        model_route=model_route,
+        input_tokens=max(0, input_tokens),
+        output_tokens=max(0, output_tokens),
+        credits=safe_credits,
+    )
+    period.used_credits = min(period.included_credits, period.used_credits + safe_credits)
+    window.used_credits = min(window.included_credits, window.used_credits + safe_credits)
+    db.add(event)
+    db.add(period)
+    db.add(window)
+    await db.commit()
+
+
+def _hosted_model_url() -> str:
+    return f"{settings.catea_hosted_model_base_url.rstrip('/')}/chat/completions"
+
+
+def _hosted_model_body(request: ChatCompletionRequest) -> dict[str, Any]:
+    body = request.model_dump(exclude_none=True)
+    body["model"] = settings.catea_hosted_model_name
+    if settings.catea_hosted_model_reasoning_effort:
+        body.setdefault("reasoning_effort", settings.catea_hosted_model_reasoning_effort)
+    return body
 
 
 def _verify_creem_signature(raw_body: bytes, signature: Optional[str]) -> bool:
@@ -366,6 +498,7 @@ async def create_creem_checkout(
     )
 
     customer = await _get_or_create_customer(db, payload.email)
+    await _ensure_billing_user(db, customer.email)
     success_url = payload.success_url or settings.catea_billing_success_url
     request_id = f"catea_{customer.uuid}_{int(_now().timestamp())}"
 
@@ -482,6 +615,8 @@ async def _status_response(
 
     result = await db.execute(query)
     customer = result.scalar_one_or_none()
+    if email:
+        await _ensure_billing_user(db, email)
     if not customer:
         return BillingLicenseStatusResponse(
             pro=False,
@@ -536,6 +671,98 @@ async def license_status(
 ):
     """Return Catea Pro entitlement status for an email or license key."""
     return await _status_response(db, email=email, license_key=license_key)
+
+
+@router.post("/hosted/v1/chat/completions")
+async def hosted_chat_completions(
+    payload: ChatCompletionRequest,
+    authorization: Optional[str] = Header(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """OpenAI-compatible hosted model endpoint for Catea Pro users."""
+    if not settings.catea_hosted_model_api_key:
+        raise HTTPException(status_code=503, detail="Catea hosted model is not configured")
+    license_key = _bearer_token(authorization)
+    if not license_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Catea Pro license is required")
+
+    customer, _, _, period, window = await _get_active_hosted_customer(db, license_key)
+    request_id = "hosted_" + secrets.token_urlsafe(24)
+    prompt_tokens = _estimate_tokens_from_messages(payload.messages)
+    outbound_body = _hosted_model_body(payload)
+    headers = {
+        "Authorization": f"Bearer {settings.catea_hosted_model_api_key}",
+        "Content-Type": "application/json",
+    }
+
+    timeout = httpx.Timeout(settings.catea_hosted_model_timeout_s, connect=20.0)
+    if payload.stream:
+        async def generate_stream():
+            output_chars = 0
+            completed = False
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                async with client.stream(
+                    "POST",
+                    _hosted_model_url(),
+                    headers=headers,
+                    json=outbound_body,
+                ) as response:
+                    if response.status_code >= 400:
+                        text = await response.aread()
+                        raise HTTPException(status_code=response.status_code, detail=text.decode("utf-8", "ignore"))
+                    async for line in response.aiter_lines():
+                        if not line:
+                            yield b"\n"
+                            continue
+                        if line.startswith("data:"):
+                            data = line[5:].strip()
+                            if data == "[DONE]":
+                                completed = True
+                            else:
+                                try:
+                                    chunk = json.loads(data)
+                                    delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                                    content = delta.get("content")
+                                    if isinstance(content, str):
+                                        output_chars += len(content)
+                                except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+                                    pass
+                        yield f"{line}\n\n".encode("utf-8")
+                        await asyncio.sleep(0)
+            if completed:
+                output_tokens = max(0, output_chars // 4)
+                await _record_hosted_usage(
+                    db=db,
+                    customer=customer,
+                    period=period,
+                    window=window,
+                    request_id=request_id,
+                    model_route=settings.catea_hosted_model_name,
+                    input_tokens=prompt_tokens,
+                    output_tokens=output_tokens,
+                    credits=prompt_tokens + output_tokens,
+                )
+
+        return StreamingResponse(generate_stream(), media_type="text/event-stream")
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(_hosted_model_url(), headers=headers, json=outbound_body)
+    if response.status_code >= 400:
+        raise HTTPException(status_code=response.status_code, detail=response.text)
+    body = response.json()
+    input_tokens, output_tokens, total_tokens = _usage_tokens(body, prompt_tokens)
+    await _record_hosted_usage(
+        db=db,
+        customer=customer,
+        period=period,
+        window=window,
+        request_id=request_id,
+        model_route=settings.catea_hosted_model_name,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        credits=total_tokens,
+    )
+    return body
 
 
 @router.get("/success", response_class=HTMLResponse)

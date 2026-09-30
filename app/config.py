@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     catea_pro_window_credits: int = 20000
     catea_pro_window_hours: int = 5
     creem_product_id_pro_monthly_cny: str = ""
+    catea_hosted_model_api_key: str = ""
+    catea_hosted_model_base_url: str = "https://api.minimax.io/v1"
+    catea_hosted_model_name: str = "MiniMax-M3.1-Flash-Preview"
+    catea_hosted_model_reasoning_effort: str = "medium"
+    catea_hosted_model_timeout_s: float = 120.0
 
     # Single-user hosted preview mode. This only controls deployment/runtime
     # behavior; production auth hardening should stay separate.
