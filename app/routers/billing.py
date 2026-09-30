@@ -2,7 +2,7 @@
 [WHO]: Provides billing router for Creem checkout creation, webhook fulfillment, license status lookup, and payment success response
 [FROM]: Depends on FastAPI request handling, SQLAlchemy async sessions, httpx for Creem API calls, hmac/hashlib for webhook signature verification, app.config settings, app.models billing tables, app.schemas billing DTOs
 [TO]: Consumed by main.py as /billing routes for Catea Pro payment and entitlement testing
-[HERE]: packages/api/app/routers/billing.py - Creem-backed Catea Pro billing integration; maps successful subscription events to local BYOK model limits
+[HERE]: packages/api/app/routers/billing.py - Creem-backed Catea Pro billing integration; maps successful subscription events to local hosted-usage entitlements
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import hashlib
 import hmac
 import json
 import secrets
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import httpx
@@ -21,7 +21,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.database import get_db
-from app.models import BillingCustomer, BillingSubscription, BillingWebhookEvent
+from app.models import (
+    BillingCustomer,
+    BillingPlan,
+    BillingPrice,
+    BillingSubscription,
+    BillingUsagePeriod,
+    BillingUsageWindow,
+    BillingWebhookEvent,
+)
 from app.schemas import (
     BillingCheckoutRequest,
     BillingCheckoutResponse,
@@ -57,20 +65,144 @@ def _normalize_email(email: str) -> str:
     return email.strip().lower()
 
 
+PRO_PLAN_ID = "pro_monthly"
+
+
 def _plan_for_product(product_id: Optional[str]) -> str:
+    if product_id in {
+        settings.creem_product_id_pro_monthly,
+        settings.creem_product_id_pro_monthly_cny,
+    }:
+        return PRO_PLAN_ID
     if product_id == settings.creem_product_id_pro_yearly:
-        return "pro_yearly"
+        # Legacy test product compatibility; new product model is monthly only.
+        return PRO_PLAN_ID
     return "pro_monthly"
 
 
-def _product_for_plan(plan: str) -> str:
-    if plan == "yearly":
-        return settings.creem_product_id_pro_yearly
+def _product_for_plan(plan: str, currency: str = "USD") -> str:
+    if currency == "CNY":
+        return settings.creem_product_id_pro_monthly_cny
     return settings.creem_product_id_pro_monthly
 
 
 def _limits_for_pro(pro: bool) -> dict[str, int]:
-    return {"byok_models": 999 if pro else 1}
+    return {"hosted_models": 1 if pro else 0}
+
+
+async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
+    result = await db.execute(select(BillingPlan).where(BillingPlan.plan_id == PRO_PLAN_ID))
+    plan = result.scalar_one_or_none()
+    if not plan:
+        plan = BillingPlan(plan_id=PRO_PLAN_ID, name="Pro")
+        db.add(plan)
+        await db.flush()
+    plan.name = "Pro"
+    plan.billing_period = "monthly"
+    plan.monthly_credits = settings.catea_pro_monthly_credits
+    plan.window_credits = settings.catea_pro_window_credits
+    plan.window_hours = settings.catea_pro_window_hours
+    plan.features = {"hosted_model": True, "byok": True}
+    plan.active = True
+
+    for currency, product_id in (
+        ("USD", settings.creem_product_id_pro_monthly),
+        ("CNY", settings.creem_product_id_pro_monthly_cny),
+    ):
+        if not product_id:
+            continue
+        existing = await db.execute(
+            select(BillingPrice).where(
+                BillingPrice.provider == "creem",
+                BillingPrice.provider_product_id == product_id,
+            )
+        )
+        price = existing.scalar_one_or_none()
+        if not price:
+            price = BillingPrice(plan_id=plan.id, provider="creem", provider_product_id=product_id)
+            db.add(price)
+        price.plan_id = plan.id
+        price.currency = currency
+        price.active = True
+    await db.flush()
+    return plan
+
+
+def _percent(used: int, included: int) -> dict[str, Any]:
+    if included <= 0:
+        return {"used_percent": 0, "remaining_percent": 0}
+    used_percent = min(100, round((used / included) * 100, 2))
+    return {"used_percent": used_percent, "remaining_percent": max(0, round(100 - used_percent, 2))}
+
+
+async def _quota_for_subscription(
+    db: AsyncSession,
+    customer: BillingCustomer,
+    subscription: Optional[BillingSubscription],
+    plan: BillingPlan,
+) -> dict[str, Any]:
+    now = _now()
+    period_start = subscription.current_period_start if subscription and subscription.current_period_start else now
+    period_end = (
+        subscription.current_period_end
+        if subscription and subscription.current_period_end and subscription.current_period_end > now
+        else period_start + timedelta(days=30)
+    )
+
+    period_result = await db.execute(
+        select(BillingUsagePeriod).where(
+            BillingUsagePeriod.customer_id == customer.id,
+            BillingUsagePeriod.period_start == period_start,
+            BillingUsagePeriod.period_end == period_end,
+        )
+    )
+    period = period_result.scalar_one_or_none()
+    if not period:
+        period = BillingUsagePeriod(
+            customer_id=customer.id,
+            subscription_id=subscription.id if subscription else None,
+            plan_id=plan.id,
+            period_start=period_start,
+            period_end=period_end,
+            included_credits=plan.monthly_credits,
+            used_credits=0,
+        )
+        db.add(period)
+
+    window_hours = max(1, plan.window_hours or 5)
+    window_start = now.replace(minute=0, second=0, microsecond=0)
+    hour_offset = window_start.hour % window_hours
+    window_start = window_start - timedelta(hours=hour_offset)
+    window_end = window_start + timedelta(hours=window_hours)
+    window_result = await db.execute(
+        select(BillingUsageWindow).where(
+            BillingUsageWindow.customer_id == customer.id,
+            BillingUsageWindow.window_start == window_start,
+            BillingUsageWindow.window_end == window_end,
+        )
+    )
+    window = window_result.scalar_one_or_none()
+    if not window:
+        window = BillingUsageWindow(
+            customer_id=customer.id,
+            plan_id=plan.id,
+            window_start=window_start,
+            window_end=window_end,
+            included_credits=plan.window_credits,
+            used_credits=0,
+        )
+        db.add(window)
+    await db.flush()
+
+    monthly = _percent(period.used_credits, period.included_credits)
+    monthly["reset_at"] = period.period_end
+    monthly["included_credits"] = period.included_credits
+    monthly["used_credits"] = period.used_credits
+    window_quota = _percent(window.used_credits, window.included_credits)
+    window_quota["reset_at"] = window.window_end
+    window_quota["included_credits"] = window.included_credits
+    window_quota["used_credits"] = window.used_credits
+    return {"monthly": monthly, "window": window_quota}
 
 
 async def _get_or_create_customer(
@@ -220,9 +352,13 @@ async def create_creem_checkout(
     if not settings.creem_api_key:
         raise HTTPException(status_code=500, detail="Creem API key is not configured")
 
-    product_id = _product_for_plan(payload.plan)
+    await _ensure_pro_plan(db)
+    product_id = _product_for_plan(payload.plan, payload.currency)
     if not product_id:
-        raise HTTPException(status_code=500, detail=f"Creem product for plan '{payload.plan}' is not configured")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Creem product for plan '{payload.plan}' and currency '{payload.currency}' is not configured",
+        )
 
     customer = await _get_or_create_customer(db, payload.email)
     success_url = payload.success_url or settings.catea_billing_success_url
@@ -237,7 +373,8 @@ async def create_creem_checkout(
             "referenceId": customer.uuid,
             "email": customer.email,
             "licenseKey": customer.license_key,
-            "plan": payload.plan,
+            "plan": PRO_PLAN_ID,
+            "currency": payload.currency,
             "source": "catea",
         },
     }
@@ -264,7 +401,7 @@ async def create_creem_checkout(
         checkout_id=checkout_id,
         checkout_url=checkout_url,
         product_id=product_id,
-        plan=payload.plan,
+        plan=PRO_PLAN_ID,
     )
 
 
@@ -323,13 +460,11 @@ async def creem_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     return {"ok": True}
 
 
-@router.get("/license/status", response_model=BillingLicenseStatusResponse)
-async def license_status(
-    email: Optional[str] = Query(default=None),
-    license_key: Optional[str] = Query(default=None),
-    db: AsyncSession = Depends(get_db),
-):
-    """Return Catea Pro entitlement status for an email or license key."""
+async def _status_response(
+    db: AsyncSession,
+    email: Optional[str] = None,
+    license_key: Optional[str] = None,
+) -> BillingLicenseStatusResponse:
     if not email and not license_key:
         raise HTTPException(status_code=400, detail="email or license_key is required")
 
@@ -345,21 +480,56 @@ async def license_status(
         return BillingLicenseStatusResponse(
             pro=False,
             email=_normalize_email(email) if email else None,
+            plan="free",
+            display_name="Free",
             status="not_found",
             limits=_limits_for_pro(False),
+            quota=None,
+            features={"hosted_model": False, "byok": True},
         )
 
     subscription = await _get_subscription_status(db, customer)
     pro = bool(subscription and subscription.active)
+    quota = None
+    display_name = "Free"
+    plan_id = "free"
+    if pro:
+        plan = await _ensure_pro_plan(db)
+        quota = await _quota_for_subscription(db, customer, subscription, plan)
+        display_name = plan.name
+        plan_id = plan.plan_id
     return BillingLicenseStatusResponse(
         pro=pro,
         email=customer.email,
         license_key=customer.license_key,
-        plan=subscription.plan if subscription else None,
+        plan=plan_id,
+        display_name=display_name,
         status=subscription.status if subscription else "no_subscription",
         current_period_end=subscription.current_period_end if subscription else None,
         limits=_limits_for_pro(pro),
+        quota=quota,
+        features={"hosted_model": pro, "byok": True},
     )
+
+
+@router.get("/me", response_model=BillingLicenseStatusResponse)
+async def billing_me(
+    email: Optional[str] = Query(default=None),
+    license_key: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the user's Catea plan, entitlement, and quota status."""
+    return await _status_response(db, email=email, license_key=license_key)
+
+
+@router.get("/license/status", response_model=BillingLicenseStatusResponse)
+async def license_status(
+    email: Optional[str] = Query(default=None),
+    license_key: Optional[str] = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return Catea Pro entitlement status for an email or license key."""
+    return await _status_response(db, email=email, license_key=license_key)
 
 
 @router.get("/success", response_class=HTMLResponse)

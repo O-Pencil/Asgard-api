@@ -1,5 +1,5 @@
 """
-[WHO]: Provides SQLAlchemy declarative models: User, APIKey, Agent, UsageLog, BalanceTransaction, BillingCustomer, BillingSubscription, BillingWebhookEvent with relationships and constraints
+[WHO]: Provides SQLAlchemy declarative models: User, APIKey, Agent, UsageLog, BalanceTransaction, BillingCustomer, BillingPlan, BillingPrice, BillingSubscription, BillingUsagePeriod, BillingUsageWindow, BillingUsageEvent, BillingWebhookEvent with relationships and constraints
 [FROM]: Depends on SQLAlchemy for ORM, uuid for UUID generation, datetime for timestamps
 [TO]: Consumed by database.py for table creation, routers for CRUD operations, services for business logic
 [HERE]: packages/api/app/models.py - Database schema definitions; core data model for multi-tenant agent management
@@ -171,6 +171,51 @@ class BillingCustomer(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     subscriptions = relationship("BillingSubscription", back_populates="customer")
+    usage_periods = relationship("BillingUsagePeriod", back_populates="customer")
+    usage_windows = relationship("BillingUsageWindow", back_populates="customer")
+    usage_events = relationship("BillingUsageEvent", back_populates="customer")
+
+
+class BillingPlan(Base):
+    """Subscription plan definition for Catea-hosted entitlements."""
+    __tablename__ = table_name("billing_plans")
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(String(64), unique=True, index=True, nullable=False)
+    name = Column(String(128), nullable=False)
+    billing_period = Column(String(32), default="monthly", nullable=False)
+    monthly_credits = Column(Integer, default=0, nullable=False)
+    window_credits = Column(Integer, default=0, nullable=False)
+    window_hours = Column(Integer, default=5, nullable=False)
+    features = Column(JSON, default=dict)
+    active = Column(Boolean, default=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    prices = relationship("BillingPrice", back_populates="plan")
+    usage_periods = relationship("BillingUsagePeriod", back_populates="plan")
+    usage_windows = relationship("BillingUsageWindow", back_populates="plan")
+
+
+class BillingPrice(Base):
+    """Provider-specific price/product mapping for one plan and currency."""
+    __tablename__ = table_name("billing_prices")
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_product_id", name="uq_billing_provider_product"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    plan_id = Column(Integer, ForeignKey(f"{BillingPlan.__tablename__}.id"), nullable=False)
+    currency = Column(String(8), nullable=False, index=True)
+    amount = Column(Integer, default=0, nullable=False)
+    provider = Column(String(32), default="creem", nullable=False, index=True)
+    provider_product_id = Column(String(128), nullable=False, index=True)
+    provider_price_id = Column(String(128), index=True)
+    active = Column(Boolean, default=True, nullable=False, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    plan = relationship("BillingPlan", back_populates="prices")
 
 
 class BillingSubscription(Base):
@@ -199,6 +244,71 @@ class BillingSubscription(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     customer = relationship("BillingCustomer", back_populates="subscriptions")
+
+
+class BillingUsagePeriod(Base):
+    """Monthly included-usage bucket for a billing customer."""
+    __tablename__ = table_name("billing_usage_periods")
+    __table_args__ = (
+        UniqueConstraint("customer_id", "period_start", "period_end", name="uq_billing_usage_period"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
+    customer_id = Column(Integer, ForeignKey(f"{BillingCustomer.__tablename__}.id"), nullable=False)
+    subscription_id = Column(Integer, ForeignKey(f"{BillingSubscription.__tablename__}.id"))
+    plan_id = Column(Integer, ForeignKey(f"{BillingPlan.__tablename__}.id"), nullable=False)
+    period_start = Column(DateTime, nullable=False, index=True)
+    period_end = Column(DateTime, nullable=False, index=True)
+    included_credits = Column(Integer, default=0, nullable=False)
+    used_credits = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer = relationship("BillingCustomer", back_populates="usage_periods")
+    plan = relationship("BillingPlan", back_populates="usage_periods")
+
+
+class BillingUsageWindow(Base):
+    """Short reset window for Codex-like hosted usage availability."""
+    __tablename__ = table_name("billing_usage_windows")
+    __table_args__ = (
+        UniqueConstraint("customer_id", "window_start", "window_end", name="uq_billing_usage_window"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
+    customer_id = Column(Integer, ForeignKey(f"{BillingCustomer.__tablename__}.id"), nullable=False)
+    plan_id = Column(Integer, ForeignKey(f"{BillingPlan.__tablename__}.id"), nullable=False)
+    window_start = Column(DateTime, nullable=False, index=True)
+    window_end = Column(DateTime, nullable=False, index=True)
+    included_credits = Column(Integer, default=0, nullable=False)
+    used_credits = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer = relationship("BillingCustomer", back_populates="usage_windows")
+    plan = relationship("BillingPlan", back_populates="usage_windows")
+
+
+class BillingUsageEvent(Base):
+    """Append-only hosted model usage event for audit and future billing."""
+    __tablename__ = table_name("billing_usage_events")
+    __table_args__ = (
+        UniqueConstraint("request_id", name="uq_billing_usage_request"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
+    customer_id = Column(Integer, ForeignKey(f"{BillingCustomer.__tablename__}.id"), nullable=False)
+    request_id = Column(String(128), nullable=False, index=True)
+    model_route = Column(String(128), nullable=False)
+    input_tokens = Column(Integer, default=0, nullable=False)
+    output_tokens = Column(Integer, default=0, nullable=False)
+    credits = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    customer = relationship("BillingCustomer", back_populates="usage_events")
 
 
 class BillingWebhookEvent(Base):

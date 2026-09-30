@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     creem_webhook_id: str = ""
     creem_webhook_secret: str = ""
     catea_billing_success_url: str = "https://asgard-api-utj6.onrender.com/billing/success"
+    catea_pro_monthly_credits: int = 100000
+    catea_pro_window_credits: int = 20000
+    catea_pro_window_hours: int = 5
+    creem_product_id_pro_monthly_cny: str = ""
 
     # Single-user hosted preview mode. This only controls deployment/runtime
     # behavior; production auth hardening should stay separate.

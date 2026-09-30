@@ -65,7 +65,8 @@ class APIKeyCreateResponse(BaseModel):
 
 class BillingCheckoutRequest(BaseModel):
     email: EmailStr
-    plan: str = Field(default="monthly", pattern="^(monthly|yearly)$")
+    plan: str = Field(default="monthly", pattern="^(monthly|pro_monthly)$")
+    currency: str = Field(default="USD", pattern="^(USD|CNY)$")
     success_url: Optional[str] = None
 
 
@@ -81,9 +82,12 @@ class BillingLicenseStatusResponse(BaseModel):
     email: Optional[str] = None
     license_key: Optional[str] = None
     plan: Optional[str] = None
+    display_name: Optional[str] = None
     status: str
     current_period_end: Optional[datetime] = None
     limits: Dict[str, int]
+    quota: Optional[Dict[str, Any]] = None
+    features: Optional[Dict[str, bool]] = None
 
 
 # ============ Agent Schemas ============
