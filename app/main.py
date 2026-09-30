@@ -21,7 +21,7 @@ from app.config import settings
 from app.database import init_db, close_db, get_db
 from app.cache import init_cache, close_cache
 from app.middleware.rate_limit import rate_limit_middleware
-from app.routers import auth, agents, chat, console, billing
+from app.routers import auth, agents, chat, console, billing, admin
 from app.services.pencil_gateway import PencilAgentBackend
 from app.auth import (
     get_user_from_jwt_or_apikey,
@@ -233,6 +233,7 @@ app.include_router(agents.router, prefix="/api/v1")
 app.include_router(console.router, prefix="/api/v1")
 app.include_router(chat.router, prefix="/v1")
 app.include_router(billing.router, prefix="/billing")
+app.include_router(admin.router)
 
 
 if __name__ == "__main__":

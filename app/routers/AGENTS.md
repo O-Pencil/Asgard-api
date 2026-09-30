@@ -12,6 +12,8 @@ API route definitions. Organized by domain: authentication, agent management, ch
 
 __init__.py: Router package initialization, aggregates and re-exports auth, agents, chat, console, billing routers
 
+admin.py: Admin-only read endpoints: GET /admin/overview (aggregate user, subscription, hosted usage and provider quota placeholder) and GET /admin/users (user list joined with billing customer, subscription and quota state), guarded by ADMIN_EMAIL JWT access
+
 auth.py: Authentication endpoints: POST /api/v1/auth/register (user creation with password hashing), POST /api/v1/auth/login (JWT token generation), GET /api/v1/auth/profile (current user info), uses Depends(get_db) and bcrypt for password verification
 
 agents.py: Agent management endpoints: GET /api/v1/agents (list all active agents), GET /api/v1/agents/{id} (agent details), POST /api/v1/agents/enable (activate agent), POST /api/v1/agents/disable (deactivate agent), admin controls with Depends(get_api_key_from_header)
