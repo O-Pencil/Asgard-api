@@ -14,12 +14,13 @@ import json
 import secrets
 from datetime import datetime, timedelta
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -108,6 +109,7 @@ def _plan_for_product(product_id: Optional[str]) -> str:
         settings.creem_product_id_pro_monthly,
         settings.creem_product_id_pro_monthly_cny,
         settings.waffo_product_id_pro_monthly,
+        _xorpay_product_id(),
     }:
         return PRO_PLAN_ID
     if product_id == settings.creem_product_id_pro_yearly:
@@ -117,6 +119,8 @@ def _plan_for_product(product_id: Optional[str]) -> str:
 
 
 def _product_for_plan(plan: str, currency: str = "USD") -> str:
+    if settings.billing_provider.lower() == "xorpay":
+        return _xorpay_product_id()
     if settings.billing_provider.lower() == "waffo":
         return settings.waffo_product_id_pro_monthly
     if currency == "CNY" and settings.creem_product_id_pro_monthly_cny:
@@ -132,6 +136,10 @@ def _creem_product_for_plan(plan: str, currency: str = "USD") -> str:
 
 def _limits_for_pro(pro: bool) -> dict[str, int]:
     return {"hosted_models": 1 if pro else 0}
+
+
+def _xorpay_product_id() -> str:
+    return "xorpay_catea_pro_monthly_cny"
 
 
 async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
@@ -185,6 +193,29 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
             db.add(price)
         price.plan_id = plan.id
         price.currency = "USD"
+        price.active = True
+    if settings.xorpay_aid:
+        product_id = _xorpay_product_id()
+        existing = await db.execute(
+            select(BillingPrice).where(
+                BillingPrice.provider == "xorpay",
+                BillingPrice.provider_product_id == product_id,
+            )
+        )
+        price = existing.scalar_one_or_none()
+        if not price:
+            price = BillingPrice(
+                plan_id=plan.id,
+                provider="xorpay",
+                provider_product_id=product_id,
+            )
+            db.add(price)
+        price.plan_id = plan.id
+        price.currency = "CNY"
+        try:
+            price.amount = int(round(float(settings.xorpay_pro_monthly_price_cny) * 100))
+        except ValueError:
+            price.amount = 1800
         price.active = True
     await db.flush()
     return plan
@@ -596,6 +627,35 @@ def _verify_creem_signature(raw_body: bytes, signature: Optional[str]) -> bool:
     return hmac.compare_digest(computed, signature)
 
 
+def _xorpay_sign(*parts: str) -> str:
+    return hashlib.md5("".join(parts).encode("utf-8")).hexdigest().lower()
+
+
+def _xorpay_price(value: str) -> str:
+    try:
+        return f"{float(value):.2f}"
+    except ValueError:
+        raise HTTPException(status_code=500, detail="XorPay CNY price is not configured correctly")
+
+
+def _xorpay_form(raw_body: bytes) -> dict[str, str]:
+    parsed = parse_qs(raw_body.decode("utf-8", "ignore"), keep_blank_values=True)
+    return {key: values[-1] if values else "" for key, values in parsed.items()}
+
+
+def _verify_xorpay_callback(data: dict[str, str]) -> bool:
+    if not settings.xorpay_app_secret:
+        return False
+    expected = _xorpay_sign(
+        data.get("aoid", ""),
+        data.get("order_id", ""),
+        data.get("pay_price", ""),
+        data.get("pay_time", ""),
+        settings.xorpay_app_secret,
+    )
+    return hmac.compare_digest(expected, data.get("sign", ""))
+
+
 WAFFO_TEST_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxnmRY6yMMA3lVqmAU6ZG
 b1sjL/+r/z6E+ZjkXaDAKiqOhk9rpazni0bNsGXwmftTPk9jy2wn+j6JHODD/WH/
@@ -908,6 +968,121 @@ async def _upsert_waffo_subscription_from_event(
     record.updated_at = _now()
 
 
+async def _create_xorpay_checkout(
+    payload: BillingCheckoutRequest,
+    db: AsyncSession,
+) -> BillingCheckoutResponse:
+    """Create a XorPay cashier payment URL for Catea Pro CNY payments."""
+    if not settings.xorpay_aid or not settings.xorpay_app_secret:
+        raise HTTPException(status_code=500, detail="XorPay credentials are not configured")
+    notify_url = settings.xorpay_notify_url or f"{settings.catea_billing_success_url.rstrip('/').removesuffix('/success')}/xorpay/webhook"
+    if not notify_url.startswith("https://"):
+        raise HTTPException(status_code=500, detail="XorPay notify_url must be a public HTTPS URL")
+    if payload.currency != "CNY":
+        raise HTTPException(status_code=400, detail="XorPay is configured for CNY payments only")
+
+    await _ensure_pro_plan(db)
+    customer = await _get_or_create_customer(db, payload.email, provider="xorpay")
+    await _ensure_billing_user(db, customer.email)
+    product_id = _xorpay_product_id()
+    order_id = f"catea_{customer.uuid.replace('-', '')}_{int(_now().timestamp())}"
+    price = _xorpay_price(settings.xorpay_pro_monthly_price_cny)
+    pay_type = settings.xorpay_pay_type or "cashier"
+    if pay_type not in {"cashier", "native", "alipay"}:
+        raise HTTPException(status_code=500, detail="XorPay pay_type must be cashier, native, or alipay")
+    name = "Catea Pro Monthly"
+    more = json.dumps(
+        {
+            "email": customer.email,
+            "licenseKey": customer.license_key,
+            "plan": PRO_PLAN_ID,
+            "productId": product_id,
+            "source": "catea",
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    sign = _xorpay_sign(name, pay_type, price, order_id, notify_url, settings.xorpay_app_secret)
+    params = {
+        "name": name,
+        "pay_type": pay_type,
+        "price": price,
+        "order_id": order_id,
+        "notify_url": notify_url,
+        "order_uid": customer.uuid,
+        "more": more,
+        "expire": "7200",
+        "sign": sign,
+    }
+    checkout_url = f"{settings.xorpay_api_base.rstrip('/')}/api/cashier/{settings.xorpay_aid}?{urlencode(params)}"
+    return BillingCheckoutResponse(
+        checkout_id=order_id,
+        checkout_url=checkout_url,
+        product_id=product_id,
+        plan=PRO_PLAN_ID,
+    )
+
+
+async def _upsert_xorpay_subscription_from_callback(
+    db: AsyncSession,
+    data: dict[str, str],
+) -> None:
+    order_id = data.get("order_id", "").strip()
+    if not order_id:
+        raise HTTPException(status_code=400, detail="Missing XorPay order_id")
+
+    metadata: dict[str, Any] = {}
+    more = data.get("more")
+    if more:
+        try:
+            parsed_more = json.loads(more)
+            if isinstance(parsed_more, dict):
+                metadata = parsed_more
+        except json.JSONDecodeError:
+            metadata = {"more": more}
+    email = _first_string(metadata.get("email"))
+    if not email:
+        raise HTTPException(status_code=400, detail="Missing XorPay customer email")
+
+    product_id = _first_string(metadata.get("productId"), _xorpay_product_id())
+    pay_time = _parse_datetime(data.get("pay_time")) or _now()
+    period_start = pay_time
+    period_end = period_start + timedelta(days=30)
+    customer = await _get_or_create_customer(db, email, provider_customer_id=None, provider="xorpay")
+    result = await db.execute(
+        select(BillingSubscription).where(
+            BillingSubscription.provider == "xorpay",
+            BillingSubscription.provider_subscription_id == order_id,
+        )
+    )
+    record = result.scalar_one_or_none()
+    if not record:
+        record = BillingSubscription(
+            customer_id=customer.id,
+            provider="xorpay",
+            provider_subscription_id=order_id,
+            plan=_plan_for_product(product_id),
+            status="active",
+        )
+        db.add(record)
+
+    record.customer_id = customer.id
+    record.provider_order_id = order_id
+    record.provider_checkout_id = data.get("aoid") or order_id
+    record.product_id = product_id
+    record.plan = _plan_for_product(product_id)
+    record.status = "active"
+    record.active = True
+    record.current_period_start = period_start
+    record.current_period_end = period_end
+    record.canceled_at = None
+    record.provider_metadata = {
+        "callback": data,
+        "metadata": metadata,
+    }
+    record.updated_at = _now()
+
+
 async def _create_waffo_checkout(
     payload: BillingCheckoutRequest,
     db: AsyncSession,
@@ -1059,9 +1234,20 @@ async def create_billing_checkout(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a checkout session with the configured payment provider."""
+    if settings.billing_provider.lower() == "xorpay" or payload.currency == "CNY":
+        return await _create_xorpay_checkout(payload, db)
     if settings.billing_provider.lower() == "waffo":
         return await _create_waffo_checkout(payload, db)
     return await _create_creem_checkout(payload, db)
+
+
+@router.post("/xorpay/checkout", response_model=BillingCheckoutResponse)
+async def create_xorpay_checkout(
+    payload: BillingCheckoutRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a XorPay cashier payment URL for Catea Pro CNY payments."""
+    return await _create_xorpay_checkout(payload, db)
 
 
 @router.post("/waffo/checkout", response_model=BillingCheckoutResponse)
@@ -1082,6 +1268,51 @@ async def create_creem_checkout(
     if settings.billing_provider.lower() == "waffo":
         return await _create_waffo_checkout(payload, db)
     return await _create_creem_checkout(payload, db)
+
+
+@router.post("/xorpay/webhook")
+async def xorpay_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    """Verify and process XorPay payment notifications."""
+    raw_body = await request.body()
+    data = _xorpay_form(raw_body)
+    if not _verify_xorpay_callback(data):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid XorPay signature")
+
+    event_id = data.get("aoid") or data.get("order_id")
+    if not event_id:
+        raise HTTPException(status_code=400, detail="Missing XorPay event id")
+    result = await db.execute(
+        select(BillingWebhookEvent).where(
+            BillingWebhookEvent.provider == "xorpay",
+            BillingWebhookEvent.provider_event_id == event_id,
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing and existing.processed:
+        return PlainTextResponse("success")
+
+    event_record = existing or BillingWebhookEvent(
+        provider="xorpay",
+        provider_event_id=event_id,
+        event_type="payment.success",
+        payload=data,
+    )
+    if not existing:
+        db.add(event_record)
+
+    try:
+        await _upsert_xorpay_subscription_from_callback(db, data)
+        event_record.processed = True
+        event_record.processed_at = _now()
+        event_record.error_message = None
+        await db.commit()
+    except Exception as exc:
+        event_record.processed = False
+        event_record.error_message = str(exc)
+        await db.flush()
+        raise
+
+    return PlainTextResponse("success")
 
 
 @router.post("/creem/webhook")
