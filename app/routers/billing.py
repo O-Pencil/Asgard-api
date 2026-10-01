@@ -1,12 +1,13 @@
 """
-[WHO]: Provides billing router for Creem checkout creation, webhook fulfillment, license status lookup, hosted model proxy, and payment success response
-[FROM]: Depends on FastAPI request handling, SQLAlchemy async sessions, httpx for Creem and hosted model API calls, hmac/hashlib for webhook signature verification, app.config settings, app.models billing tables, app.schemas billing DTOs
+[WHO]: Provides billing router for checkout creation, webhook fulfillment, license status lookup, hosted model proxy, and payment success response
+[FROM]: Depends on FastAPI request handling, SQLAlchemy async sessions, httpx for payment and hosted model API calls, hmac/hashlib and cryptography for webhook/signature verification, app.config settings, app.models billing tables, app.schemas billing DTOs
 [TO]: Consumed by main.py as /billing routes for Catea Pro payment and entitlement testing
-[HERE]: packages/api/app/routers/billing.py - Creem-backed Catea Pro billing integration; maps successful subscription events to local hosted-usage entitlements and enforces hosted model quota
+[HERE]: packages/api/app/routers/billing.py - Payment-backed Catea Pro billing integration; maps successful subscription events to local hosted-usage entitlements and enforces hosted model quota
 """
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -15,6 +16,8 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, StreamingResponse
 from sqlalchemy import select
@@ -78,6 +81,24 @@ def _bearer_token(authorization: Optional[str]) -> Optional[str]:
     return token.strip()
 
 
+WAFFO_CHECKOUT_PATH = "/v1/actions/checkout/create-session"
+WAFFO_GRANT_EVENTS = {
+    "order.completed",
+    "payment.completed",
+    "subscription.active",
+    "subscription.activated",
+    "subscription.payment_succeeded",
+    "subscription.paid",
+}
+WAFFO_REVOKE_EVENTS = {
+    "subscription.canceled",
+    "subscription.cancelled",
+    "subscription.expired",
+    "subscription.paused",
+    "subscription.past_due",
+}
+
+
 PRO_PLAN_ID = "pro_monthly"
 
 
@@ -85,6 +106,7 @@ def _plan_for_product(product_id: Optional[str]) -> str:
     if product_id in {
         settings.creem_product_id_pro_monthly,
         settings.creem_product_id_pro_monthly_cny,
+        settings.waffo_product_id_pro_monthly,
     }:
         return PRO_PLAN_ID
     if product_id == settings.creem_product_id_pro_yearly:
@@ -94,6 +116,14 @@ def _plan_for_product(product_id: Optional[str]) -> str:
 
 
 def _product_for_plan(plan: str, currency: str = "USD") -> str:
+    if settings.billing_provider.lower() == "waffo":
+        return settings.waffo_product_id_pro_monthly
+    if currency == "CNY" and settings.creem_product_id_pro_monthly_cny:
+        return settings.creem_product_id_pro_monthly_cny
+    return settings.creem_product_id_pro_monthly
+
+
+def _creem_product_for_plan(plan: str, currency: str = "USD") -> str:
     if currency == "CNY" and settings.creem_product_id_pro_monthly_cny:
         return settings.creem_product_id_pro_monthly_cny
     return settings.creem_product_id_pro_monthly
@@ -136,6 +166,24 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
             db.add(price)
         price.plan_id = plan.id
         price.currency = currency
+        price.active = True
+    if settings.waffo_product_id_pro_monthly:
+        existing = await db.execute(
+            select(BillingPrice).where(
+                BillingPrice.provider == "waffo",
+                BillingPrice.provider_product_id == settings.waffo_product_id_pro_monthly,
+            )
+        )
+        price = existing.scalar_one_or_none()
+        if not price:
+            price = BillingPrice(
+                plan_id=plan.id,
+                provider="waffo",
+                provider_product_id=settings.waffo_product_id_pro_monthly,
+            )
+            db.add(price)
+        price.plan_id = plan.id
+        price.currency = "USD"
         price.active = True
     await db.flush()
     return plan
@@ -249,11 +297,14 @@ async def _get_or_create_customer(
     db: AsyncSession,
     email: str,
     provider_customer_id: Optional[str] = None,
+    provider: str = "creem",
 ) -> BillingCustomer:
     normalized_email = _normalize_email(email)
     result = await db.execute(select(BillingCustomer).where(BillingCustomer.email == normalized_email))
     customer = result.scalar_one_or_none()
     if customer:
+        if provider and customer.provider != provider:
+            customer.provider = provider
         if provider_customer_id and customer.provider_customer_id != provider_customer_id:
             customer.provider_customer_id = provider_customer_id
             customer.updated_at = _now()
@@ -261,7 +312,7 @@ async def _get_or_create_customer(
 
     customer = BillingCustomer(
         email=normalized_email,
-        provider="creem",
+        provider=provider,
         provider_customer_id=provider_customer_id,
         license_key="catea_" + secrets.token_urlsafe(24),
     )
@@ -405,6 +456,113 @@ def _verify_creem_signature(raw_body: bytes, signature: Optional[str]) -> bool:
     return hmac.compare_digest(computed, signature)
 
 
+WAFFO_TEST_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAxnmRY6yMMA3lVqmAU6ZG
+b1sjL/+r/z6E+ZjkXaDAKiqOhk9rpazni0bNsGXwmftTPk9jy2wn+j6JHODD/WH/
+SCnSfvKkLIjy4Hk7BuCgB174C0ydan7J+KgXLkOwgCAxxB68t2tezldwo74ZpXgn
+F49opzMvQ9prEwIAWOE+kV9iK6gx/AckSMtHIHpUesoPDkldpmFHlB2qpf1vsFTZ
+5kD6DmGl+2GIVK01aChy2lk8pLv0yUMu18v44sLkO5M44TkGPJD9qG09wrvVG2wp
+OTVCn1n5pP8P+HRLcgzbUB3OlZVfdFurn6EZwtyL4ZD9kdkQ4EZE/9inKcp3c1h4
+xwIDAQAB
+-----END PUBLIC KEY-----"""
+
+WAFFO_PROD_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz+xApdTIb4ua+DgZKQ54
+iBsD82ybyhGCLRETONW4Jgbb3A8DUM1LqBk6r/CmTOCHqLalTQHNigvP3R5zkDNX
+iRJz6gA4MJ/+8K0+mnEE2RISQzN+Qu65TNd6svb+INm/kMaftY4uIXr6y6kchtTJ
+dwnQhcKdAL2v7h7IFnkVelQsKxDdb2PqX8xX/qwd01iXvMcpCCaXovUwZsxH2QN5
+ZKBTseJivbhUeyJCco4fdUyxOMHe2ybCVhyvim2uxAl1nkvL5L8RCWMCAV55LLo0
+9OhmLahz/DYNu13YLVP6dvIT09ZFBYU6Owj1NxdinTynlJCFS9VYwBgmftosSE1U
+dwIDAQAB
+-----END PUBLIC KEY-----"""
+
+
+def _wrap_base64_key(raw: str, header: str, footer: str) -> str:
+    base64_body = "".join(raw.split())
+    lines = "\n".join(base64_body[index : index + 64] for index in range(0, len(base64_body), 64))
+    return f"{header}\n{lines}\n{footer}"
+
+
+def _normalize_waffo_private_key(raw: str) -> bytes:
+    value = raw.replace("\\n", "\n").replace("\r\n", "\n").strip()
+    if "-----BEGIN" in value:
+        return value.encode("utf-8")
+    pem = _wrap_base64_key(value, "-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----")
+    return pem.encode("utf-8")
+
+
+def _normalize_waffo_public_key(raw: str) -> bytes:
+    value = raw.replace("\\n", "\n").replace("\r\n", "\n").strip()
+    if "-----BEGIN" in value:
+        return value.encode("utf-8")
+    pem = _wrap_base64_key(value, "-----BEGIN PUBLIC KEY-----", "-----END PUBLIC KEY-----")
+    return pem.encode("utf-8")
+
+
+def _waffo_private_key():
+    return serialization.load_pem_private_key(
+        _normalize_waffo_private_key(settings.waffo_private_key),
+        password=None,
+    )
+
+
+def _waffo_public_key(environment: str):
+    configured = settings.waffo_webhook_public_key.strip()
+    if configured:
+        key = configured
+    elif environment == "prod":
+        key = WAFFO_PROD_PUBLIC_KEY
+    else:
+        key = WAFFO_TEST_PUBLIC_KEY
+    return serialization.load_pem_public_key(_normalize_waffo_public_key(key))
+
+
+def _waffo_body_json(body: dict[str, Any]) -> str:
+    return json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+
+
+def _waffo_signature(method: str, path: str, timestamp: str, body_json: str) -> str:
+    body_hash = base64.b64encode(hashlib.sha256(body_json.encode("utf-8")).digest()).decode("ascii")
+    canonical_request = f"{method}\n{path}\n{timestamp}\n{body_hash}"
+    signature = _waffo_private_key().sign(
+        canonical_request.encode("utf-8"),
+        padding.PKCS1v15(),
+        hashes.SHA256(),
+    )
+    return base64.b64encode(signature).decode("ascii")
+
+
+def _verify_waffo_signature(raw_body: bytes, signature_header: Optional[str]) -> bool:
+    if not signature_header:
+        return False
+    pairs = {}
+    for pair in signature_header.split(","):
+        key, separator, value = pair.partition("=")
+        if separator:
+            pairs[key.strip()] = value.strip()
+    timestamp = pairs.get("t")
+    signature = pairs.get("v1")
+    if not timestamp or not signature:
+        return False
+    try:
+        age_ms = int(_now().timestamp() * 1000) - int(timestamp)
+    except ValueError:
+        return False
+    if age_ms > 45 * 60 * 1000 or age_ms < -60 * 1000:
+        return False
+    public_key = _waffo_public_key(settings.waffo_environment.lower())
+    try:
+        public_key.verify(
+            base64.b64decode(signature),
+            timestamp.encode("utf-8") + b"." + raw_body,
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+    except Exception:
+        return False
+    return True
+
+
 async def _upsert_subscription_from_event(
     db: AsyncSession,
     event_type: str,
@@ -498,17 +656,205 @@ async def _upsert_subscription_from_event(
     record.updated_at = _now()
 
 
-@router.post("/creem/checkout", response_model=BillingCheckoutResponse)
-async def create_creem_checkout(
+def _first_string(*values: Any) -> Optional[str]:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _waffo_event_period(data: dict[str, Any]) -> tuple[Optional[datetime], Optional[datetime]]:
+    start = _parse_datetime(
+        _first_string(
+            data.get("currentPeriodStart"),
+            data.get("current_period_start"),
+            data.get("current_period_start_date"),
+            data.get("periodStart"),
+            data.get("period_start"),
+        )
+    )
+    end = _parse_datetime(
+        _first_string(
+            data.get("currentPeriodEnd"),
+            data.get("current_period_end"),
+            data.get("current_period_end_date"),
+            data.get("periodEnd"),
+            data.get("period_end"),
+            data.get("nextBillingAt"),
+            data.get("next_billing_at"),
+        )
+    )
+    if not end and start:
+        end = start + timedelta(days=30)
+    if not start:
+        start = _parse_datetime(_first_string(data.get("createdAt"), data.get("created_at"))) or _now()
+    if not end:
+        end = start + timedelta(days=30)
+    return start, end
+
+
+async def _upsert_waffo_subscription_from_event(
+    db: AsyncSession,
+    event: dict[str, Any],
+) -> None:
+    event_type = str(event.get("eventType") or "")
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    metadata = data.get("orderMetadata") if isinstance(data.get("orderMetadata"), dict) else {}
+    email = _first_string(
+        data.get("buyerEmail"),
+        data.get("customerEmail"),
+        metadata.get("email"),
+    )
+    if not email:
+        return
+
+    order_id = _first_string(data.get("orderId"), data.get("id"), event.get("eventId"))
+    subscription_id = _first_string(
+        data.get("subscriptionId"),
+        data.get("subscriptionOrderId"),
+        data.get("originOrderId"),
+        order_id,
+    )
+    if not subscription_id:
+        return
+
+    product_id = _first_string(
+        data.get("productId"),
+        metadata.get("productId"),
+        settings.waffo_product_id_pro_monthly,
+    )
+    raw_status = _first_string(data.get("status"), data.get("subscriptionStatus"))
+    if event_type in WAFFO_GRANT_EVENTS:
+        status_value = raw_status or "active"
+        active = True
+    elif event_type in WAFFO_REVOKE_EVENTS:
+        status_value = raw_status or event_type.removeprefix("subscription.")
+        active = status_value in {"canceling", "scheduled_cancel"}
+    else:
+        status_value = raw_status or "active"
+        active = status_value in ACTIVE_STATUSES
+
+    current_period_start, current_period_end = _waffo_event_period(data)
+    canceled_at = _parse_datetime(_first_string(data.get("canceledAt"), data.get("cancelledAt"), data.get("canceled_at")))
+    customer = await _get_or_create_customer(db, email, provider_customer_id=None, provider="waffo")
+    result = await db.execute(
+        select(BillingSubscription).where(
+            BillingSubscription.provider == "waffo",
+            BillingSubscription.provider_subscription_id == subscription_id,
+        )
+    )
+    record = result.scalar_one_or_none()
+    if not record:
+        record = BillingSubscription(
+            customer_id=customer.id,
+            provider="waffo",
+            provider_subscription_id=subscription_id,
+            plan=_plan_for_product(product_id),
+            status=status_value,
+        )
+        db.add(record)
+
+    record.customer_id = customer.id
+    record.provider_order_id = order_id
+    record.provider_checkout_id = _first_string(data.get("checkoutSessionId"), data.get("checkoutId"))
+    record.product_id = product_id
+    record.plan = _plan_for_product(product_id)
+    record.status = status_value
+    record.active = active
+    record.current_period_start = current_period_start
+    record.current_period_end = current_period_end
+    record.canceled_at = canceled_at
+    record.provider_metadata = {"event": event, "metadata": metadata}
+    record.updated_at = _now()
+
+
+async def _create_waffo_checkout(
     payload: BillingCheckoutRequest,
-    db: AsyncSession = Depends(get_db),
-):
+    db: AsyncSession,
+) -> BillingCheckoutResponse:
+    """Create a Waffo Pancake checkout session for Catea Pro."""
+    if not settings.waffo_merchant_id or not settings.waffo_private_key:
+        raise HTTPException(status_code=500, detail="Waffo Pancake credentials are not configured")
+    if not settings.waffo_store_id:
+        raise HTTPException(status_code=500, detail="Waffo Pancake store is not configured")
+
+    await _ensure_pro_plan(db)
+    product_id = _product_for_plan(payload.plan, payload.currency)
+    if not product_id:
+        raise HTTPException(status_code=500, detail=f"Waffo product for plan '{payload.plan}' is not configured")
+    if payload.currency == "CNY":
+        raise HTTPException(status_code=400, detail="CNY subscriptions are not supported in the current Waffo test setup")
+
+    customer = await _get_or_create_customer(db, payload.email, provider="waffo")
+    await _ensure_billing_user(db, customer.email)
+    success_url = payload.success_url or settings.catea_billing_success_url
+    request_id = f"catea_{customer.uuid}_{int(_now().timestamp())}"
+    body = {
+        "storeId": settings.waffo_store_id,
+        "productId": product_id,
+        "productType": "subscription",
+        "currency": "USD",
+        "buyerEmail": customer.email,
+        "successUrl": success_url,
+        "metadata": {
+            "referenceId": customer.uuid,
+            "email": customer.email,
+            "licenseKey": customer.license_key,
+            "plan": PRO_PLAN_ID,
+            "currency": "USD",
+            "requestedCurrency": payload.currency,
+            "productId": product_id,
+            "source": "catea",
+        },
+        "orderMerchantExternalId": request_id,
+    }
+    body_json = _waffo_body_json(body)
+    timestamp = str(int(_now().timestamp()))
+    signature = _waffo_signature("POST", WAFFO_CHECKOUT_PATH, timestamp, body_json)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            f"{settings.waffo_api_base.rstrip('/')}{WAFFO_CHECKOUT_PATH}",
+            headers={
+                "Content-Type": "application/json",
+                "X-Merchant-Id": settings.waffo_merchant_id,
+                "X-Timestamp": timestamp,
+                "X-Signature": signature,
+                "X-Idempotency-Key": request_id,
+            },
+            content=body_json,
+        )
+    try:
+        checkout = response.json()
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail=response.text)
+    if response.status_code >= 400 or checkout.get("errors"):
+        raise HTTPException(status_code=response.status_code, detail=checkout)
+
+    data = checkout.get("data") if isinstance(checkout.get("data"), dict) else checkout
+    checkout_url = data.get("checkoutUrl") or data.get("checkout_url")
+    checkout_id = data.get("sessionId") or data.get("checkoutSessionId") or data.get("id")
+    if not checkout_url or not checkout_id:
+        raise HTTPException(status_code=502, detail="Waffo checkout response did not include checkout URL")
+
+    return BillingCheckoutResponse(
+        checkout_id=checkout_id,
+        checkout_url=checkout_url,
+        product_id=product_id,
+        plan=PRO_PLAN_ID,
+    )
+
+
+async def _create_creem_checkout(
+    payload: BillingCheckoutRequest,
+    db: AsyncSession,
+) -> BillingCheckoutResponse:
     """Create a Creem checkout session for Catea Pro."""
     if not settings.creem_api_key:
         raise HTTPException(status_code=500, detail="Creem API key is not configured")
 
     await _ensure_pro_plan(db)
-    product_id = _product_for_plan(payload.plan, payload.currency)
+    product_id = _creem_product_for_plan(payload.plan, payload.currency)
     if not product_id:
         raise HTTPException(
             status_code=500,
@@ -567,6 +913,37 @@ async def create_creem_checkout(
     )
 
 
+@router.post("/checkout", response_model=BillingCheckoutResponse)
+async def create_billing_checkout(
+    payload: BillingCheckoutRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a checkout session with the configured payment provider."""
+    if settings.billing_provider.lower() == "waffo":
+        return await _create_waffo_checkout(payload, db)
+    return await _create_creem_checkout(payload, db)
+
+
+@router.post("/waffo/checkout", response_model=BillingCheckoutResponse)
+async def create_waffo_checkout(
+    payload: BillingCheckoutRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a Waffo Pancake checkout session for Catea Pro."""
+    return await _create_waffo_checkout(payload, db)
+
+
+@router.post("/creem/checkout", response_model=BillingCheckoutResponse)
+async def create_creem_checkout(
+    payload: BillingCheckoutRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a Creem checkout session for backward compatibility."""
+    if settings.billing_provider.lower() == "waffo":
+        return await _create_waffo_checkout(payload, db)
+    return await _create_creem_checkout(payload, db)
+
+
 @router.post("/creem/webhook")
 async def creem_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     """Verify and process Creem webhook events."""
@@ -608,6 +985,61 @@ async def creem_webhook(request: Request, db: AsyncSession = Depends(get_db)):
         if event_type in GRANT_EVENTS or event_type.startswith("subscription."):
             await _upsert_subscription_from_event(db, event_type, event.get("object") or {})
         elif event_type in {"refund.created", "dispute.created"}:
+            # Conservative MVP behavior: record the event; manual review can
+            # revoke access if needed once refund/dispute policy is finalized.
+            pass
+        event_record.processed = True
+        event_record.processed_at = _now()
+        event_record.error_message = None
+    except Exception as exc:
+        event_record.processed = False
+        event_record.error_message = str(exc)
+        raise
+
+    return {"ok": True}
+
+
+@router.post("/waffo/webhook")
+async def waffo_webhook(request: Request, db: AsyncSession = Depends(get_db)):
+    """Verify and process Waffo Pancake webhook events."""
+    raw_body = await request.body()
+    signature = request.headers.get("x-waffo-signature") or request.headers.get("X-Waffo-Signature")
+    if not _verify_waffo_signature(raw_body, signature):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Waffo signature")
+
+    try:
+        event = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    event_id = event.get("id") or event.get("eventId")
+    event_type = event.get("eventType")
+    if not event_id or not event_type:
+        raise HTTPException(status_code=400, detail="Missing Waffo event id or eventType")
+
+    result = await db.execute(
+        select(BillingWebhookEvent).where(
+            BillingWebhookEvent.provider == "waffo",
+            BillingWebhookEvent.provider_event_id == str(event_id),
+        )
+    )
+    existing = result.scalar_one_or_none()
+    if existing and existing.processed:
+        return {"ok": True, "duplicate": True}
+
+    event_record = existing or BillingWebhookEvent(
+        provider="waffo",
+        provider_event_id=str(event_id),
+        event_type=str(event_type),
+        payload=event,
+    )
+    if not existing:
+        db.add(event_record)
+
+    try:
+        if str(event_type) in WAFFO_GRANT_EVENTS or str(event_type).startswith("subscription."):
+            await _upsert_waffo_subscription_from_event(db, event)
+        elif str(event_type) in {"refund.created", "dispute.created", "order.refunded"}:
             # Conservative MVP behavior: record the event; manual review can
             # revoke access if needed once refund/dispute policy is finalized.
             pass
@@ -807,7 +1239,7 @@ async def billing_success():
       <head><title>Catea Pro checkout complete</title></head>
       <body style="font-family: system-ui, sans-serif; max-width: 720px; margin: 48px auto;">
         <h1>Catea Pro checkout complete</h1>
-        <p>Your payment was received by Creem. You can return to Catea and refresh your Pro status.</p>
+        <p>Your payment was received. You can return to Catea and refresh your Pro status.</p>
       </body>
     </html>
     """

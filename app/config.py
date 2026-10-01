@@ -49,7 +49,8 @@ class Settings(BaseSettings):
     pencil_default_provider: Optional[str] = None
     pencil_default_model: Optional[str] = None
 
-    # Creem billing for Catea Pro
+    # Billing for Catea Pro
+    billing_provider: str = "creem"
     creem_api_key: str = ""
     creem_api_base: str = "https://test-api.creem.io"
     creem_environment: str = "test"
@@ -62,6 +63,13 @@ class Settings(BaseSettings):
     catea_pro_window_credits: int = 20000
     catea_pro_window_hours: int = 5
     creem_product_id_pro_monthly_cny: str = ""
+    waffo_api_base: str = "https://waffo-pancake-auth-service.vercel.app"
+    waffo_environment: str = "test"
+    waffo_merchant_id: str = ""
+    waffo_store_id: str = ""
+    waffo_private_key: str = ""
+    waffo_product_id_pro_monthly: str = ""
+    waffo_webhook_public_key: str = ""
     catea_hosted_model_api_key: str = ""
     catea_hosted_model_base_url: str = "https://api.minimax.io/v1"
     catea_hosted_model_name: str = "MiniMax-M3.1-Flash-Preview"
