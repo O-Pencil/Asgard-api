@@ -277,7 +277,18 @@ async def _get_subscription_status(db: AsyncSession, customer: BillingCustomer) 
         .where(BillingSubscription.customer_id == customer.id)
         .order_by(BillingSubscription.updated_at.desc())
     )
-    return result.scalars().first()
+    subscription = result.scalars().first()
+    if (
+        subscription
+        and subscription.active
+        and subscription.current_period_end
+        and subscription.current_period_end <= _now()
+    ):
+        subscription.active = False
+        subscription.status = "expired"
+        db.add(subscription)
+        await db.flush()
+    return subscription
 
 
 async def _get_active_hosted_customer(
