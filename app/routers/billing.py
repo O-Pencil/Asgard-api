@@ -82,6 +82,7 @@ def _bearer_token(authorization: Optional[str]) -> Optional[str]:
 
 
 WAFFO_CHECKOUT_PATH = "/v1/actions/checkout/create-session"
+WAFFO_CONTENT_SAFETY_PATH = "/v1/actions/verification/scan-prompt"
 WAFFO_GRANT_EVENTS = {
     "order.completed",
     "payment.completed",
@@ -393,6 +394,145 @@ def _message_text(message: Any) -> str:
 def _estimate_tokens_from_messages(messages: list[Any]) -> int:
     text = "\n".join(_message_text(message) for message in messages)
     return max(1, len(text) // 4)
+
+
+def _latest_user_prompt(messages: list[Any]) -> str:
+    for message in reversed(messages):
+        role = message.get("role") if isinstance(message, dict) else getattr(message, "role", None)
+        if role == "user":
+            return _message_text(message).strip()
+    for message in reversed(messages):
+        text = _message_text(message).strip()
+        if text:
+            return text
+    return ""
+
+
+def _content_safety_locale(payload: dict[str, Any]) -> str:
+    metadata = payload.get("metadata")
+    value = None
+    if isinstance(metadata, dict):
+        value = metadata.get("locale") or metadata.get("language")
+    if not isinstance(value, str) or value not in {"ja", "en", "zh"}:
+        value = settings.waffo_content_safety_locale
+    if value not in {"ja", "en", "zh"}:
+        return "zh"
+    return value
+
+
+def _content_safety_semantic() -> str:
+    value = settings.waffo_content_safety_semantic
+    if value not in {"off", "shadow", "enforce"}:
+        return "enforce"
+    return value
+
+
+async def _scan_waffo_prompt(prompt: str, locale: str) -> dict[str, Any]:
+    if not settings.waffo_content_safety_enabled:
+        return {"action": "allow", "reasonCode": "disabled"}
+    prompt = prompt.strip()
+    if not prompt:
+        return {"action": "allow", "reasonCode": "empty_prompt"}
+    if not settings.waffo_merchant_id or not settings.waffo_private_key:
+        raise HTTPException(status_code=503, detail="Waffo content safety is not configured")
+
+    body = {
+        "prompt": prompt[:10000],
+        "locale": locale,
+        "semantic": _content_safety_semantic(),
+    }
+    body_json = _waffo_body_json(body)
+    timestamp = str(int(_now().timestamp()))
+    signature = _waffo_signature("POST", WAFFO_CONTENT_SAFETY_PATH, timestamp, body_json)
+    headers = {
+        "Content-Type": "application/json",
+        "X-Merchant-Id": settings.waffo_merchant_id,
+        "X-Timestamp": timestamp,
+        "X-Signature": signature,
+    }
+    last_error: Optional[Exception] = None
+    async with httpx.AsyncClient(timeout=15) as client:
+        for attempt in range(3):
+            try:
+                response = await client.post(
+                    f"{settings.waffo_content_safety_api_base.rstrip('/')}{WAFFO_CONTENT_SAFETY_PATH}",
+                    headers=headers,
+                    content=body_json,
+                )
+            except httpx.HTTPError as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2**attempt))
+                    continue
+                break
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "code": "content_safety_rate_limited",
+                        "message": "Content safety check is rate limited. Please retry later.",
+                        "retry_after": retry_after,
+                    },
+                )
+            if 500 <= response.status_code < 600:
+                if attempt < 2:
+                    await asyncio.sleep(0.5 * (2**attempt))
+                    continue
+                raise HTTPException(
+                    status_code=503,
+                    detail={
+                        "code": "content_safety_unavailable",
+                        "message": "Content safety check is temporarily unavailable. Please retry later.",
+                    },
+                )
+            if response.status_code >= 400:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "code": "content_safety_failed",
+                        "message": "Content safety check rejected the request.",
+                    },
+                )
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if isinstance(data, dict):
+                return data
+            if isinstance(payload, dict):
+                return payload
+            break
+    if last_error:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "content_safety_unavailable",
+                "message": "Content safety check is temporarily unavailable. Please retry later.",
+            },
+        )
+    return {"action": "review", "reasonCode": "service_degraded"}
+
+
+def _raise_for_content_safety(verdict: dict[str, Any]) -> None:
+    action = verdict.get("action")
+    if action == "allow":
+        return
+    reason = verdict.get("reasonCode")
+    message = (
+        "This request does not comply with Catea's AI usage policy."
+        if action == "block"
+        else "This request requires safety review. Please retry later."
+    )
+    raise HTTPException(
+        status_code=403,
+        detail={
+            "code": "content_safety_rejected",
+            "message": message,
+            "action": action or "review",
+            "reasonCode": reason,
+            "requestId": verdict.get("requestId"),
+            "matchedCategories": verdict.get("matchedCategories") or [],
+        },
+    )
 
 
 def _usage_tokens(payload: dict[str, Any], fallback: int) -> tuple[int, int, int]:
@@ -1154,6 +1294,11 @@ async def hosted_chat_completions(
         raise HTTPException(status_code=400, detail="messages must be an array")
     request_id = "hosted_" + secrets.token_urlsafe(24)
     prompt_tokens = _estimate_tokens_from_messages(messages)
+    safety_verdict = await _scan_waffo_prompt(
+        _latest_user_prompt(messages),
+        _content_safety_locale(payload),
+    )
+    _raise_for_content_safety(safety_verdict)
     outbound_body = _hosted_model_body(payload)
     headers = {
         "Authorization": f"Bearer {settings.catea_hosted_model_api_key}",

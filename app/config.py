@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     waffo_private_key: str = ""
     waffo_product_id_pro_monthly: str = ""
     waffo_webhook_public_key: str = ""
+    waffo_content_safety_enabled: bool = False
+    waffo_content_safety_api_base: str = "https://api.waffo.ai"
+    waffo_content_safety_locale: str = "zh"
+    waffo_content_safety_semantic: str = "enforce"
     catea_hosted_model_api_key: str = ""
     catea_hosted_model_base_url: str = "https://api.minimax.io/v1"
     catea_hosted_model_name: str = "MiniMax-M3.1-Flash-Preview"
