@@ -689,12 +689,13 @@ async def license_status(
 async def hosted_chat_completions(
     request: Request,
     authorization: Optional[str] = Header(default=None),
+    x_catea_license: Optional[str] = Header(default=None, alias="X-Catea-License"),
     db: AsyncSession = Depends(get_db),
 ):
     """OpenAI-compatible hosted model endpoint for Catea Pro users."""
     if not settings.catea_hosted_model_api_key:
         raise HTTPException(status_code=503, detail="Catea hosted model is not configured")
-    license_key = _bearer_token(authorization)
+    license_key = (x_catea_license or "").strip() or _bearer_token(authorization)
     if not license_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Catea Pro license is required")
 
