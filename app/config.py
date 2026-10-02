@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     waffo_store_id: str = ""
     waffo_private_key: str = ""
     waffo_product_id_pro_monthly: str = ""
+    waffo_product_id_pro_30d: str = ""
     waffo_webhook_public_key: str = ""
     waffo_content_safety_enabled: bool = False
     waffo_content_safety_api_base: str = "https://api.waffo.ai"

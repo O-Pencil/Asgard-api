@@ -65,7 +65,7 @@ class APIKeyCreateResponse(BaseModel):
 
 class BillingCheckoutRequest(BaseModel):
     email: EmailStr
-    plan: str = Field(default="monthly", pattern="^(monthly|pro_monthly)$")
+    plan: str = Field(default="monthly", pattern="^(monthly|pro_monthly|pro_30d)$")
     currency: str = Field(default="USD", pattern="^(USD|CNY)$")
     success_url: Optional[str] = None
 

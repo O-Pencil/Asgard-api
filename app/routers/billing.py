@@ -109,6 +109,7 @@ def _plan_for_product(product_id: Optional[str]) -> str:
         settings.creem_product_id_pro_monthly,
         settings.creem_product_id_pro_monthly_cny,
         settings.waffo_product_id_pro_monthly,
+        settings.waffo_product_id_pro_30d,
         _xorpay_product_id(),
     }:
         return PRO_PLAN_ID
@@ -122,6 +123,8 @@ def _product_for_plan(plan: str, currency: str = "USD") -> str:
     if settings.billing_provider.lower() == "xorpay":
         return _xorpay_product_id()
     if settings.billing_provider.lower() == "waffo":
+        if plan == "pro_30d" or currency == "CNY":
+            return settings.waffo_product_id_pro_30d
         return settings.waffo_product_id_pro_monthly
     if currency == "CNY" and settings.creem_product_id_pro_monthly_cny:
         return settings.creem_product_id_pro_monthly_cny
@@ -176,11 +179,16 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
         price.plan_id = plan.id
         price.currency = currency
         price.active = True
-    if settings.waffo_product_id_pro_monthly:
+    for currency, product_id in (
+        ("USD", settings.waffo_product_id_pro_monthly),
+        ("CNY", settings.waffo_product_id_pro_30d),
+    ):
+        if not product_id:
+            continue
         existing = await db.execute(
             select(BillingPrice).where(
                 BillingPrice.provider == "waffo",
-                BillingPrice.provider_product_id == settings.waffo_product_id_pro_monthly,
+                BillingPrice.provider_product_id == product_id,
             )
         )
         price = existing.scalar_one_or_none()
@@ -188,11 +196,11 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
             price = BillingPrice(
                 plan_id=plan.id,
                 provider="waffo",
-                provider_product_id=settings.waffo_product_id_pro_monthly,
+                provider_product_id=product_id,
             )
             db.add(price)
         price.plan_id = plan.id
-        price.currency = "USD"
+        price.currency = currency
         price.active = True
     if settings.xorpay_aid:
         product_id = _xorpay_product_id()
@@ -923,6 +931,13 @@ async def _upsert_waffo_subscription_from_event(
         metadata.get("productId"),
         settings.waffo_product_id_pro_monthly,
     )
+    one_time_pass = bool(
+        product_id
+        and (
+            product_id == settings.waffo_product_id_pro_30d
+            or metadata.get("billingMode") == "one_time_30d"
+        )
+    )
     raw_status = _first_string(data.get("status"), data.get("subscriptionStatus"))
     if event_type in WAFFO_GRANT_EVENTS:
         status_value = raw_status or "active"
@@ -953,6 +968,12 @@ async def _upsert_waffo_subscription_from_event(
             status=status_value,
         )
         db.add(record)
+
+    if one_time_pass and active:
+        now = _now()
+        base = record.current_period_end if record.current_period_end and record.current_period_end > now else now
+        current_period_start = now
+        current_period_end = base + timedelta(days=30)
 
     record.customer_id = customer.id
     record.provider_order_id = order_id
@@ -1097,8 +1118,9 @@ async def _create_waffo_checkout(
     product_id = _product_for_plan(payload.plan, payload.currency)
     if not product_id:
         raise HTTPException(status_code=500, detail=f"Waffo product for plan '{payload.plan}' is not configured")
-    if payload.currency == "CNY":
-        raise HTTPException(status_code=400, detail="CNY subscriptions are not supported in the current Waffo test setup")
+    one_time_pass = payload.plan == "pro_30d" or payload.currency == "CNY"
+    checkout_currency = "CNY" if one_time_pass else "USD"
+    product_type = "onetime" if one_time_pass else "subscription"
 
     customer = await _get_or_create_customer(db, payload.email, provider="waffo")
     await _ensure_billing_user(db, customer.email)
@@ -1107,8 +1129,8 @@ async def _create_waffo_checkout(
     body = {
         "storeId": settings.waffo_store_id,
         "productId": product_id,
-        "productType": "subscription",
-        "currency": "USD",
+        "productType": product_type,
+        "currency": checkout_currency,
         "buyerEmail": customer.email,
         "successUrl": success_url,
         "metadata": {
@@ -1116,13 +1138,16 @@ async def _create_waffo_checkout(
             "email": customer.email,
             "licenseKey": customer.license_key,
             "plan": PRO_PLAN_ID,
-            "currency": "USD",
+            "currency": checkout_currency,
             "requestedCurrency": payload.currency,
+            "billingMode": "one_time_30d" if one_time_pass else "subscription_monthly",
             "productId": product_id,
             "source": "catea",
         },
         "orderMerchantExternalId": request_id,
     }
+    if one_time_pass:
+        body["includePaymentMethods"] = ["wechat"]
     body_json = _waffo_body_json(body)
     timestamp = str(int(_now().timestamp()))
     signature = _waffo_signature("POST", WAFFO_CHECKOUT_PATH, timestamp, body_json)
@@ -1234,10 +1259,10 @@ async def create_billing_checkout(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a checkout session with the configured payment provider."""
-    if settings.billing_provider.lower() == "xorpay" or payload.currency == "CNY":
-        return await _create_xorpay_checkout(payload, db)
     if settings.billing_provider.lower() == "waffo":
         return await _create_waffo_checkout(payload, db)
+    if settings.billing_provider.lower() == "xorpay" or payload.currency == "CNY":
+        return await _create_xorpay_checkout(payload, db)
     return await _create_creem_checkout(payload, db)
 
 
