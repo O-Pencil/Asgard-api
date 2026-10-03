@@ -1576,6 +1576,17 @@ async def hosted_chat_completions(
                     if response.status_code >= 400:
                         text = await response.aread()
                         raise HTTPException(status_code=response.status_code, detail=text.decode("utf-8", "ignore"))
+                    content_type = response.headers.get("content-type", "")
+                    if "text/event-stream" not in content_type:
+                        text = (await response.aread()).decode("utf-8", "ignore")
+                        message = (
+                            "Hosted model upstream returned a non-stream response. "
+                            f"content-type={content_type or 'unknown'}; body={text[:300]}"
+                        )
+                        yield f"data: {json.dumps({'error': {'message': message}}, ensure_ascii=False)}\n\n".encode(
+                            "utf-8"
+                        )
+                        return
                     async for line in response.aiter_lines():
                         if not line:
                             yield b"\n"
@@ -1615,7 +1626,18 @@ async def hosted_chat_completions(
         response = await client.post(_hosted_model_url(), headers=headers, json=outbound_body)
     if response.status_code >= 400:
         raise HTTPException(status_code=response.status_code, detail=response.text)
-    body = response.json()
+    try:
+        body = response.json()
+    except json.JSONDecodeError:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "hosted_model_non_json",
+                "message": "Hosted model upstream returned a non-JSON response.",
+                "content_type": response.headers.get("content-type"),
+                "body": response.text[:300],
+            },
+        )
     input_tokens, output_tokens, total_tokens = _usage_tokens(body, prompt_tokens)
     await _record_hosted_usage(
         db=db,
