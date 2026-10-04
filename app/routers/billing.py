@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_password_hash
@@ -290,16 +291,24 @@ async def _ensure_billing_user(db: AsyncSession, email: str) -> User:
     user = result.scalar_one_or_none()
     if user:
         return user
-    user = User(
-        email=normalized_email,
-        hashed_password=get_password_hash(secrets.token_urlsafe(32)),
-        full_name="Catea billing user",
-        balance=0.0,
-        is_active=True,
-    )
-    db.add(user)
-    await db.flush()
-    return user
+    try:
+        async with db.begin_nested():
+            user = User(
+                email=normalized_email,
+                hashed_password=get_password_hash(secrets.token_urlsafe(32)),
+                full_name="Catea billing user",
+                balance=0.0,
+                is_active=True,
+            )
+            db.add(user)
+            await db.flush()
+            return user
+    except IntegrityError:
+        result = await db.execute(select(User).where(User.email == normalized_email))
+        user = result.scalar_one_or_none()
+        if user:
+            return user
+        raise
 
 
 def _percent(used: int, included: int) -> dict[str, Any]:
@@ -418,16 +427,29 @@ async def _get_or_create_customer(
             customer.updated_at = _now()
         return customer
 
-    customer = BillingCustomer(
-        email=normalized_email,
-        provider=provider,
-        provider_customer_id=provider_customer_id,
-        license_key="catea_" + secrets.token_urlsafe(24),
-    )
-    db.add(customer)
     await _ensure_billing_user(db, normalized_email)
-    await db.flush()
-    return customer
+    try:
+        async with db.begin_nested():
+            customer = BillingCustomer(
+                email=normalized_email,
+                provider=provider,
+                provider_customer_id=provider_customer_id,
+                license_key="catea_" + secrets.token_urlsafe(24),
+            )
+            db.add(customer)
+            await db.flush()
+            return customer
+    except IntegrityError:
+        result = await db.execute(select(BillingCustomer).where(BillingCustomer.email == normalized_email))
+        customer = result.scalar_one_or_none()
+        if customer:
+            if provider and customer.provider != provider:
+                customer.provider = provider
+            if provider_customer_id and customer.provider_customer_id != provider_customer_id:
+                customer.provider_customer_id = provider_customer_id
+                customer.updated_at = _now()
+            return customer
+        raise
 
 
 async def _get_subscription_status(db: AsyncSession, customer: BillingCustomer) -> Optional[BillingSubscription]:
