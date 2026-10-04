@@ -21,7 +21,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -326,6 +326,14 @@ async def _quota_for_subscription(
 ) -> dict[str, Any]:
     period, window = await _ensure_usage_buckets(db, customer, subscription, plan)
     topup_balance = await _get_credit_balance(db, customer)
+    topup_granted = await db.scalar(
+        select(func.coalesce(func.sum(BillingCreditGrant.credits), 0)).where(
+            BillingCreditGrant.customer_id == customer.id
+        )
+    )
+    topup_included = int(topup_granted or 0)
+    topup_remaining = max(0, int(topup_balance.balance_credits or 0))
+    topup_used = max(0, topup_included - topup_remaining)
     monthly = _percent(period.used_credits, period.included_credits)
     monthly["reset_at"] = period.period_end
     monthly["included_credits"] = period.included_credits
@@ -334,7 +342,11 @@ async def _quota_for_subscription(
     window_quota["reset_at"] = window.window_end
     window_quota["included_credits"] = window.included_credits
     window_quota["used_credits"] = window.used_credits
-    return {"monthly": monthly, "window": window_quota, "topup": {"balance_credits": topup_balance.balance_credits}}
+    topup = _percent(topup_used, topup_included)
+    topup["included_credits"] = topup_included
+    topup["used_credits"] = topup_used
+    topup["balance_credits"] = topup_remaining
+    return {"monthly": monthly, "window": window_quota, "topup": topup}
 
 
 async def _get_credit_balance(db: AsyncSession, customer: BillingCustomer) -> BillingCreditBalance:
