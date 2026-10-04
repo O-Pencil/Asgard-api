@@ -1307,7 +1307,7 @@ async def _create_waffo_checkout(
         checkout_id=checkout_id,
         checkout_url=checkout_url,
         product_id=product_id,
-        plan=PRO_PLAN_ID,
+        plan=payload.plan if credit_pack else PRO_PLAN_ID,
     )
 
 
