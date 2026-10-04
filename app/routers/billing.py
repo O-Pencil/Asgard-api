@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 from datetime import datetime, timedelta
 from typing import Any, Optional
@@ -20,7 +21,7 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,6 +50,7 @@ from app.schemas import (
 
 
 router = APIRouter(prefix="", tags=["Billing"])
+logger = logging.getLogger(__name__)
 
 ACTIVE_STATUSES = {"active", "trialing", "paid", "scheduled_cancel"}
 GRANT_EVENTS = {"checkout.completed", "subscription.active", "subscription.paid", "subscription.trialing"}
@@ -111,6 +113,113 @@ CREDIT_PACKS = {
     "credits_50k": {"credits": 50_000, "usd": "6.00", "cny": "36.00"},
     "credits_100k": {"credits": 100_000, "usd": "9.90", "cny": "60.00"},
 }
+
+HOSTED_REQUEST_ID_HEADER = "X-Catea-Request-Id"
+
+
+def _hosted_error_response(
+    request_id: str,
+    status_code: int,
+    code: str,
+    message: str,
+    *,
+    retry_after: Optional[str] = None,
+) -> JSONResponse:
+    """Return a stable OpenAI-compatible error without exposing upstream details."""
+    headers = {HOSTED_REQUEST_ID_HEADER: request_id}
+    if retry_after:
+        headers["Retry-After"] = retry_after
+    return JSONResponse(
+        status_code=status_code,
+        headers=headers,
+        content={
+            "error": {
+                "message": message,
+                "type": "catea_hosted_error",
+                "code": code,
+                "request_id": request_id,
+            }
+        },
+    )
+
+
+def _hosted_http_error_response(request_id: str, exc: HTTPException) -> JSONResponse:
+    """Translate entitlement and safety failures into the hosted API contract."""
+    detail = exc.detail if isinstance(exc.detail, dict) else {}
+    detail_code = detail.get("code") if isinstance(detail.get("code"), str) else ""
+    detail_message = detail.get("message") if isinstance(detail.get("message"), str) else ""
+    if detail_code.startswith("content_safety_"):
+        return _hosted_error_response(
+            request_id,
+            exc.status_code,
+            detail_code,
+            detail_message or "This request could not be processed under Catea's AI usage policy.",
+        )
+    if exc.status_code == status.HTTP_401_UNAUTHORIZED:
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_401_UNAUTHORIZED,
+            "authorization_failed",
+            "Catea Pro authorization failed. Refresh your plan status and try again.",
+        )
+    if exc.status_code == status.HTTP_402_PAYMENT_REQUIRED:
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_402_PAYMENT_REQUIRED,
+            "subscription_required",
+            "An active Catea Pro subscription is required.",
+        )
+    if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
+        raw_detail = str(exc.detail).lower()
+        code = "window_quota_exceeded" if "reset soon" in raw_detail else "quota_exceeded"
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            code,
+            "Catea Pro usage is temporarily unavailable. Check your plan usage and try again later.",
+        )
+    if exc.status_code in {status.HTTP_400_BAD_REQUEST, status.HTTP_422_UNPROCESSABLE_ENTITY}:
+        return _hosted_error_response(
+            request_id,
+            exc.status_code,
+            detail_code or "invalid_request",
+            detail_message or "The model request is invalid.",
+        )
+    return _hosted_error_response(
+        request_id,
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail_code or "service_unavailable",
+        "Catea's hosted model is temporarily unavailable. Please try again later.",
+    )
+
+
+def _hosted_upstream_error_response(
+    request_id: str,
+    upstream_status: int,
+    retry_after: Optional[str] = None,
+) -> JSONResponse:
+    """Map provider failures to public Catea errors while retaining status in logs."""
+    if upstream_status == status.HTTP_429_TOO_MANY_REQUESTS:
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "upstream_rate_limited",
+            "Catea's hosted model is busy. Please try again shortly.",
+            retry_after=retry_after,
+        )
+    if upstream_status in {status.HTTP_400_BAD_REQUEST, status.HTTP_422_UNPROCESSABLE_ENTITY}:
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_400_BAD_REQUEST,
+            "upstream_rejected_request",
+            "The hosted model could not process this request.",
+        )
+    return _hosted_error_response(
+        request_id,
+        status.HTTP_503_SERVICE_UNAVAILABLE,
+        "upstream_unavailable",
+        "Catea's hosted model is temporarily unavailable. Please try again later.",
+    )
 
 
 def _credit_product_ids() -> dict[str, str]:
@@ -667,9 +776,16 @@ def _usage_tokens(payload: dict[str, Any], fallback: int) -> tuple[int, int, int
     usage = payload.get("usage") if isinstance(payload, dict) else None
     if not isinstance(usage, dict):
         return fallback, 0, fallback
-    prompt = int(usage.get("prompt_tokens") or 0)
-    completion = int(usage.get("completion_tokens") or 0)
-    total = int(usage.get("total_tokens") or prompt + completion or fallback)
+
+    def token_count(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    prompt = token_count(usage.get("prompt_tokens"))
+    completion = token_count(usage.get("completion_tokens"))
+    total = token_count(usage.get("total_tokens")) or prompt + completion or fallback
     return prompt or fallback, completion, total
 
 
@@ -685,7 +801,27 @@ async def _record_hosted_usage(
     credits: int,
 ) -> None:
     safe_credits = max(1, credits)
-    balance = await _get_credit_balance(db, customer)
+    # Serialize successful usage updates so concurrent requests cannot overwrite
+    # each other's counters while retaining separate append-only usage events.
+    locked_period = await db.scalar(
+        select(BillingUsagePeriod)
+        .where(BillingUsagePeriod.id == period.id)
+        .with_for_update()
+    )
+    locked_window = await db.scalar(
+        select(BillingUsageWindow)
+        .where(BillingUsageWindow.id == window.id)
+        .with_for_update()
+    )
+    balance = await db.scalar(
+        select(BillingCreditBalance)
+        .where(BillingCreditBalance.customer_id == customer.id)
+        .with_for_update()
+    )
+    if not locked_period or not locked_window:
+        raise RuntimeError("Hosted usage bucket disappeared before accounting")
+    if not balance:
+        balance = await _get_credit_balance(db, customer)
     event = BillingUsageEvent(
         customer_id=customer.id,
         request_id=request_id,
@@ -694,17 +830,23 @@ async def _record_hosted_usage(
         output_tokens=max(0, output_tokens),
         credits=safe_credits,
     )
-    monthly_remaining = max(0, period.included_credits - period.used_credits)
+    monthly_remaining = max(0, locked_period.included_credits - locked_period.used_credits)
     monthly_credits = min(monthly_remaining, safe_credits)
     topup_credits = max(0, safe_credits - monthly_credits)
-    period.used_credits = min(period.included_credits, period.used_credits + monthly_credits)
+    locked_period.used_credits = min(
+        locked_period.included_credits,
+        locked_period.used_credits + monthly_credits,
+    )
     if topup_credits:
         balance.balance_credits = max(0, balance.balance_credits - topup_credits)
         db.add(balance)
-    window.used_credits = min(window.included_credits, window.used_credits + safe_credits)
+    locked_window.used_credits = min(
+        locked_window.included_credits,
+        locked_window.used_credits + safe_credits,
+    )
     db.add(event)
-    db.add(period)
-    db.add(window)
+    db.add(locked_period)
+    db.add(locked_window)
     await db.commit()
 
 
@@ -1780,29 +1922,75 @@ async def hosted_chat_completions(
     db: AsyncSession = Depends(get_db),
 ):
     """OpenAI-compatible hosted model endpoint for Catea Pro users."""
+    request_id = "hosted_" + secrets.token_urlsafe(24)
     if not settings.catea_hosted_model_api_key:
-        raise HTTPException(status_code=503, detail="Catea hosted model is not configured")
+        logger.error("Hosted request %s rejected: model provider is not configured", request_id)
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "service_not_configured",
+            "Catea's hosted model is temporarily unavailable. Please try again later.",
+        )
     license_key = (x_catea_license or "").strip() or _bearer_token(authorization)
     if not license_key:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Catea Pro license is required")
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_401_UNAUTHORIZED,
+            "authorization_required",
+            "Catea Pro authorization is required.",
+        )
 
-    customer, _, _, period, window = await _get_active_hosted_customer(db, license_key)
+    try:
+        customer, _, _, period, window = await _get_active_hosted_customer(db, license_key)
+    except HTTPException as exc:
+        logger.info("Hosted request %s rejected by entitlement status=%s", request_id, exc.status_code)
+        return _hosted_http_error_response(request_id, exc)
+    except Exception:
+        await db.rollback()
+        logger.exception("Hosted request %s entitlement lookup failed", request_id)
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "entitlement_unavailable",
+            "Catea Pro authorization is temporarily unavailable. Please try again later.",
+        )
     try:
         payload = await request.json()
     except json.JSONDecodeError:
-        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        return _hosted_error_response(
+            request_id,
+            400,
+            "invalid_json",
+            "The request body must be valid JSON.",
+        )
     if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="Request body must be a JSON object")
+        return _hosted_error_response(
+            request_id,
+            400,
+            "invalid_request",
+            "The request body must be a JSON object.",
+        )
     messages = payload.get("messages")
     if not isinstance(messages, list):
-        raise HTTPException(status_code=400, detail="messages must be an array")
-    request_id = "hosted_" + secrets.token_urlsafe(24)
+        return _hosted_error_response(request_id, 400, "invalid_messages", "messages must be an array.")
     prompt_tokens = _estimate_tokens_from_messages(messages)
-    safety_verdict = await _scan_waffo_prompt(
-        _latest_user_prompt(messages),
-        _content_safety_locale(payload),
-    )
-    _raise_for_content_safety(safety_verdict)
+    try:
+        safety_verdict = await _scan_waffo_prompt(
+            _latest_user_prompt(messages),
+            _content_safety_locale(payload),
+        )
+        _raise_for_content_safety(safety_verdict)
+    except HTTPException as exc:
+        logger.info("Hosted request %s rejected by content safety status=%s", request_id, exc.status_code)
+        return _hosted_http_error_response(request_id, exc)
+    except Exception:
+        logger.exception("Hosted request %s content safety check failed", request_id)
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "content_safety_unavailable",
+            "Catea's safety check is temporarily unavailable. Please try again later.",
+        )
     outbound_body = _hosted_model_body(payload)
     headers = {
         "Authorization": f"Bearer {settings.catea_hosted_model_api_key}",
@@ -1810,52 +1998,127 @@ async def hosted_chat_completions(
     }
 
     timeout = httpx.Timeout(settings.catea_hosted_model_timeout_s, connect=20.0)
+    logger.info(
+        "Hosted request %s started customer=%s stream=%s model=%s",
+        request_id,
+        customer.uuid,
+        payload.get("stream") is True,
+        settings.catea_hosted_model_name,
+    )
     if payload.get("stream") is True:
+        client = httpx.AsyncClient(timeout=timeout)
+        try:
+            upstream_request = client.build_request(
+                "POST",
+                _hosted_model_url(),
+                headers=headers,
+                json=outbound_body,
+            )
+            response = await client.send(upstream_request, stream=True)
+        except httpx.TimeoutException:
+            await client.aclose()
+            logger.warning("Hosted request %s timed out before stream start", request_id)
+            return _hosted_error_response(
+                request_id,
+                status.HTTP_504_GATEWAY_TIMEOUT,
+                "upstream_timeout",
+                "Catea's hosted model timed out. Please try again.",
+            )
+        except httpx.HTTPError as exc:
+            await client.aclose()
+            logger.warning(
+                "Hosted request %s could not reach upstream: %s",
+                request_id,
+                type(exc).__name__,
+            )
+            return _hosted_error_response(
+                request_id,
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "upstream_unavailable",
+                "Catea's hosted model is temporarily unavailable. Please try again later.",
+            )
+        if response.status_code >= 400:
+            upstream_status = response.status_code
+            retry_after = response.headers.get("Retry-After")
+            await response.aread()
+            await response.aclose()
+            await client.aclose()
+            logger.warning(
+                "Hosted request %s upstream rejected stream status=%s",
+                request_id,
+                upstream_status,
+            )
+            return _hosted_upstream_error_response(request_id, upstream_status, retry_after)
+        content_type = response.headers.get("content-type", "")
+        if "text/event-stream" not in content_type:
+            await response.aread()
+            await response.aclose()
+            await client.aclose()
+            logger.warning(
+                "Hosted request %s received non-stream response content_type=%s",
+                request_id,
+                content_type or "unknown",
+            )
+            return _hosted_error_response(
+                request_id,
+                status.HTTP_502_BAD_GATEWAY,
+                "upstream_protocol_error",
+                "Catea's hosted model returned an invalid response. Please try again later.",
+            )
+
         async def generate_stream():
             output_chars = 0
             completed = False
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
-                    "POST",
-                    _hosted_model_url(),
-                    headers=headers,
-                    json=outbound_body,
-                ) as response:
-                    if response.status_code >= 400:
-                        text = await response.aread()
-                        raise HTTPException(status_code=response.status_code, detail=text.decode("utf-8", "ignore"))
-                    content_type = response.headers.get("content-type", "")
-                    if "text/event-stream" not in content_type:
-                        text = (await response.aread()).decode("utf-8", "ignore")
-                        message = (
-                            "Hosted model upstream returned a non-stream response. "
-                            f"content-type={content_type or 'unknown'}; body={text[:300]}"
-                        )
-                        yield f"data: {json.dumps({'error': {'message': message}}, ensure_ascii=False)}\n\n".encode(
-                            "utf-8"
-                        )
-                        return
-                    async for line in response.aiter_lines():
-                        if not line:
-                            yield b"\n"
-                            continue
-                        if line.startswith("data:"):
-                            data = line[5:].strip()
-                            if data == "[DONE]":
-                                completed = True
-                            else:
-                                try:
-                                    chunk = json.loads(data)
-                                    delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
-                                    content = delta.get("content")
-                                    if isinstance(content, str):
-                                        output_chars += len(content)
-                                except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
-                                    pass
-                        yield f"{line}\n\n".encode("utf-8")
-                        await asyncio.sleep(0)
-            if completed:
-                output_tokens = max(0, output_chars // 4)
+            upstream_usage: Optional[tuple[int, int, int]] = None
+            try:
+                async for line in response.aiter_lines():
+                    if not line:
+                        yield b"\n"
+                        continue
+                    if line.startswith("data:"):
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            completed = True
+                        else:
+                            try:
+                                chunk = json.loads(data)
+                                if isinstance(chunk, dict) and isinstance(chunk.get("usage"), dict):
+                                    upstream_usage = _usage_tokens(chunk, prompt_tokens)
+                                delta = (chunk.get("choices") or [{}])[0].get("delta") or {}
+                                content = delta.get("content")
+                                if isinstance(content, str):
+                                    output_chars += len(content)
+                            except (json.JSONDecodeError, AttributeError, IndexError, TypeError):
+                                pass
+                    yield f"{line}\n\n".encode("utf-8")
+                    await asyncio.sleep(0)
+            except httpx.HTTPError as exc:
+                logger.warning(
+                    "Hosted request %s stream interrupted: %s",
+                    request_id,
+                    type(exc).__name__,
+                )
+                error = {
+                    "error": {
+                        "message": "Catea's hosted model connection was interrupted. Please try again.",
+                        "type": "catea_hosted_error",
+                        "code": "upstream_stream_interrupted",
+                        "request_id": request_id,
+                    }
+                }
+                yield f"data: {json.dumps(error, ensure_ascii=False)}\n\n".encode("utf-8")
+            finally:
+                await response.aclose()
+                await client.aclose()
+            if not completed:
+                return
+            fallback_output_tokens = max(0, output_chars // 4)
+            input_tokens, output_tokens, total_tokens = upstream_usage or (
+                prompt_tokens,
+                fallback_output_tokens,
+                prompt_tokens + fallback_output_tokens,
+            )
+            try:
                 await _record_hosted_usage(
                     db=db,
                     customer=customer,
@@ -1863,42 +2126,101 @@ async def hosted_chat_completions(
                     window=window,
                     request_id=request_id,
                     model_route=settings.catea_hosted_model_name,
-                    input_tokens=prompt_tokens,
+                    input_tokens=input_tokens,
                     output_tokens=output_tokens,
-                    credits=prompt_tokens + output_tokens,
+                    credits=total_tokens,
                 )
+            except Exception:
+                await db.rollback()
+                logger.exception("Hosted request %s usage accounting failed after stream", request_id)
+            else:
+                logger.info("Hosted request %s completed stream credits=%s", request_id, total_tokens)
 
-        return StreamingResponse(generate_stream(), media_type="text/event-stream")
+        return StreamingResponse(
+            generate_stream(),
+            media_type="text/event-stream",
+            headers={
+                HOSTED_REQUEST_ID_HEADER: request_id,
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
+        )
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(_hosted_model_url(), headers=headers, json=outbound_body)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(_hosted_model_url(), headers=headers, json=outbound_body)
+    except httpx.TimeoutException:
+        logger.warning("Hosted request %s timed out", request_id)
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_504_GATEWAY_TIMEOUT,
+            "upstream_timeout",
+            "Catea's hosted model timed out. Please try again.",
+        )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Hosted request %s could not reach upstream: %s",
+            request_id,
+            type(exc).__name__,
+        )
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "upstream_unavailable",
+            "Catea's hosted model is temporarily unavailable. Please try again later.",
+        )
     if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
+        logger.warning(
+            "Hosted request %s upstream rejected status=%s",
+            request_id,
+            response.status_code,
+        )
+        return _hosted_upstream_error_response(
+            request_id,
+            response.status_code,
+            response.headers.get("Retry-After"),
+        )
     try:
         body = response.json()
     except json.JSONDecodeError:
-        raise HTTPException(
-            status_code=502,
-            detail={
-                "code": "hosted_model_non_json",
-                "message": "Hosted model upstream returned a non-JSON response.",
-                "content_type": response.headers.get("content-type"),
-                "body": response.text[:300],
-            },
+        logger.warning(
+            "Hosted request %s received non-JSON response content_type=%s",
+            request_id,
+            response.headers.get("content-type") or "unknown",
+        )
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_502_BAD_GATEWAY,
+            "upstream_protocol_error",
+            "Catea's hosted model returned an invalid response. Please try again later.",
+        )
+    if not isinstance(body, dict):
+        logger.warning("Hosted request %s received non-object JSON response", request_id)
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_502_BAD_GATEWAY,
+            "upstream_protocol_error",
+            "Catea's hosted model returned an invalid response. Please try again later.",
         )
     input_tokens, output_tokens, total_tokens = _usage_tokens(body, prompt_tokens)
-    await _record_hosted_usage(
-        db=db,
-        customer=customer,
-        period=period,
-        window=window,
-        request_id=request_id,
-        model_route=settings.catea_hosted_model_name,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        credits=total_tokens,
-    )
-    return body
+    try:
+        await _record_hosted_usage(
+            db=db,
+            customer=customer,
+            period=period,
+            window=window,
+            request_id=request_id,
+            model_route=settings.catea_hosted_model_name,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            credits=total_tokens,
+        )
+    except Exception:
+        await db.rollback()
+        logger.exception("Hosted request %s usage accounting failed after response", request_id)
+    else:
+        logger.info("Hosted request %s completed credits=%s", request_id, total_tokens)
+    return JSONResponse(content=body, headers={HOSTED_REQUEST_ID_HEADER: request_id})
 
 
 @router.get("/success", response_class=HTMLResponse)
