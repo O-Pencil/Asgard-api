@@ -199,16 +199,7 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
     ):
         if not product_id:
             continue
-        existing = await db.execute(
-            select(BillingPrice).where(
-                BillingPrice.provider == "creem",
-                BillingPrice.provider_product_id == product_id,
-            )
-        )
-        price = existing.scalar_one_or_none()
-        if not price:
-            price = BillingPrice(plan_id=plan.id, provider="creem", provider_product_id=product_id)
-            db.add(price)
+        price = await _get_or_create_billing_price(db, "creem", product_id)
         price.plan_id = plan.id
         price.currency = currency
         price.active = True
@@ -218,20 +209,7 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
     ):
         if not product_id:
             continue
-        existing = await db.execute(
-            select(BillingPrice).where(
-                BillingPrice.provider == "waffo",
-                BillingPrice.provider_product_id == product_id,
-            )
-        )
-        price = existing.scalar_one_or_none()
-        if not price:
-            price = BillingPrice(
-                plan_id=plan.id,
-                provider="waffo",
-                provider_product_id=product_id,
-            )
-            db.add(price)
+        price = await _get_or_create_billing_price(db, "waffo", product_id)
         price.plan_id = plan.id
         price.currency = currency
         price.active = True
@@ -239,20 +217,7 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
         if not product_id:
             continue
         pack = CREDIT_PACKS[plan_id]
-        existing = await db.execute(
-            select(BillingPrice).where(
-                BillingPrice.provider == "waffo",
-                BillingPrice.provider_product_id == product_id,
-            )
-        )
-        price = existing.scalar_one_or_none()
-        if not price:
-            price = BillingPrice(
-                plan_id=plan.id,
-                provider="waffo",
-                provider_product_id=product_id,
-            )
-            db.add(price)
+        price = await _get_or_create_billing_price(db, "waffo", product_id)
         price.plan_id = plan.id
         price.currency = "USD"
         price.amount = int(round(float(pack["usd"]) * 100))
@@ -260,20 +225,7 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
 
     if settings.xorpay_aid:
         product_id = _xorpay_product_id()
-        existing = await db.execute(
-            select(BillingPrice).where(
-                BillingPrice.provider == "xorpay",
-                BillingPrice.provider_product_id == product_id,
-            )
-        )
-        price = existing.scalar_one_or_none()
-        if not price:
-            price = BillingPrice(
-                plan_id=plan.id,
-                provider="xorpay",
-                provider_product_id=product_id,
-            )
-            db.add(price)
+        price = await _get_or_create_billing_price(db, "xorpay", product_id)
         price.plan_id = plan.id
         price.currency = "CNY"
         try:
@@ -308,6 +260,39 @@ async def _ensure_billing_user(db: AsyncSession, email: str) -> User:
         user = result.scalar_one_or_none()
         if user:
             return user
+        raise
+
+
+async def _get_or_create_billing_price(
+    db: AsyncSession,
+    provider: str,
+    product_id: str,
+) -> BillingPrice:
+    result = await db.execute(
+        select(BillingPrice).where(
+            BillingPrice.provider == provider,
+            BillingPrice.provider_product_id == product_id,
+        )
+    )
+    price = result.scalar_one_or_none()
+    if price:
+        return price
+    try:
+        async with db.begin_nested():
+            price = BillingPrice(provider=provider, provider_product_id=product_id)
+            db.add(price)
+            await db.flush()
+            return price
+    except IntegrityError:
+        result = await db.execute(
+            select(BillingPrice).where(
+                BillingPrice.provider == provider,
+                BillingPrice.provider_product_id == product_id,
+            )
+        )
+        price = result.scalar_one_or_none()
+        if price:
+            return price
         raise
 
 
