@@ -86,6 +86,7 @@ def _bearer_token(authorization: Optional[str]) -> Optional[str]:
 
 
 WAFFO_CHECKOUT_PATH = "/v1/actions/checkout/create-session"
+WAFFO_GRAPHQL_PATH = "/v1/graphql"
 WAFFO_CONTENT_SAFETY_PATH = "/v1/actions/verification/scan-prompt"
 WAFFO_GRANT_EVENTS = {
     "order.completed",
@@ -1035,6 +1036,107 @@ async def _grant_waffo_credits_from_event(
     db.add(grant)
 
 
+async def _reconcile_waffo_credit_packs_for_customer(db: AsyncSession, customer: BillingCustomer) -> None:
+    if settings.billing_provider.lower() != "waffo":
+        return
+    if not settings.waffo_merchant_id or not settings.waffo_private_key or not settings.waffo_store_id:
+        return
+
+    product_ids = {plan: product_id for plan, product_id in _credit_product_ids().items() if product_id}
+    if not product_ids:
+        return
+
+    query = """
+    query($storeId:String!, $email:String!, $productIds:[String!]) {
+      onetimeOrders(
+        storeId:$storeId,
+        limit:50,
+        filter:{buyerEmail:{eq:$email}, productId:{in:$productIds}, status:{eq:"completed"}},
+        orderBy:[created_at_desc]
+      ) {
+        id
+        buyerEmail
+        status
+        currency
+        metadata
+        productVersion { productId }
+        onetimeProduct { id }
+        total { amount currency }
+        payments { id status }
+      }
+    }
+    """
+    body = {
+        "query": query,
+        "variables": {
+            "storeId": settings.waffo_store_id,
+            "email": customer.email,
+            "productIds": list(product_ids.values()),
+        },
+    }
+    body_json = _waffo_body_json(body)
+    timestamp = str(int(_now().timestamp()))
+    signature = _waffo_signature("POST", WAFFO_GRAPHQL_PATH, timestamp, body_json)
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            f"{settings.waffo_api_base.rstrip('/')}{WAFFO_GRAPHQL_PATH}",
+            headers={
+                "Content-Type": "application/json",
+                "X-Merchant-Id": settings.waffo_merchant_id,
+                "X-Timestamp": timestamp,
+                "X-Signature": signature,
+            },
+            content=body_json,
+        )
+    if response.status_code >= 400:
+        return
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        return
+    if payload.get("errors"):
+        return
+
+    orders = ((payload.get("data") or {}).get("onetimeOrders") or [])
+    product_to_pack = {product_id: (plan, CREDIT_PACKS[plan]) for plan, product_id in product_ids.items()}
+    for order in orders:
+        if not isinstance(order, dict) or str(order.get("status") or "").lower() != "completed":
+            continue
+        product_id = _first_string(
+            ((order.get("onetimeProduct") or {}).get("id") if isinstance(order.get("onetimeProduct"), dict) else None),
+            ((order.get("productVersion") or {}).get("productId") if isinstance(order.get("productVersion"), dict) else None),
+        )
+        pack = product_to_pack.get(product_id or "")
+        if not pack:
+            continue
+        payments = order.get("payments") if isinstance(order.get("payments"), list) else []
+        if payments and not any(str(payment.get("status") or "").lower() in {"succeeded", "completed"} for payment in payments if isinstance(payment, dict)):
+            continue
+        metadata = {}
+        if isinstance(order.get("metadata"), str) and order.get("metadata"):
+            try:
+                parsed_metadata = json.loads(order["metadata"])
+                if isinstance(parsed_metadata, dict):
+                    metadata = parsed_metadata
+            except json.JSONDecodeError:
+                metadata = {}
+        event = {
+            "id": f"reconcile:{order.get('id')}",
+            "eventType": "order.completed",
+            "data": {
+                "orderId": order.get("id"),
+                "buyerEmail": customer.email,
+                "currency": order.get("currency"),
+                "productId": product_id,
+                "orderMetadata": metadata,
+                "total": order.get("total"),
+                "payments": payments,
+            },
+        }
+        await _grant_waffo_credits_from_event(db, event, customer, product_id or "credits_pack", int(pack[1]["credits"]))
+
+
 async def _upsert_waffo_subscription_from_event(
     db: AsyncSession,
     event: dict[str, Any],
@@ -1631,6 +1733,7 @@ async def _status_response(
     display_name = "Free"
     plan_id = "free"
     if pro:
+        await _reconcile_waffo_credit_packs_for_customer(db, customer)
         plan = await _ensure_pro_plan(db)
         quota = await _quota_for_subscription(db, customer, subscription, plan)
         display_name = plan.name
