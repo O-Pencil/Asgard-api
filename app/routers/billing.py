@@ -21,6 +21,7 @@ import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
@@ -1152,30 +1153,78 @@ async def _grant_waffo_credits_from_event(
     if not provider_event_id or provider_event_id == "None":
         provider_event_id = f"waffo:{customer.uuid}:{product_id}:{int(_now().timestamp())}"
 
+    order = data.get("order") if isinstance(data.get("order"), dict) else {}
+    provider_order_id = _first_string(
+        data.get("orderId"),
+        data.get("order_id"),
+        order.get("id"),
+        event.get("orderId"),
+        data.get("id"),
+        provider_event_id,
+    )
+    if not provider_order_id:
+        provider_order_id = provider_event_id
+    canonical_grant_id = f"order:{provider_order_id}"
+
+    # Serialize grants for one customer before checking order idempotency. Waffo
+    # can emit payment.completed and order.completed for the same purchase, and
+    # reconciliation may observe it again later under a third event id.
+    await db.scalar(
+        select(BillingCustomer.id)
+        .where(BillingCustomer.id == customer.id)
+        .with_for_update()
+    )
+
     existing = await db.execute(
         select(BillingCreditGrant).where(
             BillingCreditGrant.provider == "waffo",
-            BillingCreditGrant.provider_event_id == provider_event_id,
+            BillingCreditGrant.customer_id == customer.id,
         )
     )
-    if existing.scalar_one_or_none():
-        return
+    for prior_grant in existing.scalars():
+        if prior_grant.provider_event_id == canonical_grant_id:
+            return
+        prior_metadata = prior_grant.provider_metadata if isinstance(prior_grant.provider_metadata, dict) else {}
+        prior_event = prior_metadata.get("event") if isinstance(prior_metadata.get("event"), dict) else {}
+        prior_data = prior_event.get("data") if isinstance(prior_event.get("data"), dict) else {}
+        prior_order = prior_data.get("order") if isinstance(prior_data.get("order"), dict) else {}
+        prior_order_id = _first_string(
+            prior_data.get("orderId"),
+            prior_data.get("order_id"),
+            prior_order.get("id"),
+            prior_event.get("orderId"),
+            prior_data.get("id"),
+        )
+        if prior_order_id == provider_order_id:
+            return
 
-    balance = await _get_credit_balance(db, customer)
+    balance = await db.scalar(
+        select(BillingCreditBalance)
+        .where(BillingCreditBalance.customer_id == customer.id)
+        .with_for_update()
+    )
+    if not balance:
+        balance = await _get_credit_balance(db, customer)
     safe_credits = max(1, credits)
     balance.balance_credits += safe_credits
     grant = BillingCreditGrant(
         customer_id=customer.id,
         provider="waffo",
-        provider_event_id=provider_event_id,
+        provider_event_id=canonical_grant_id,
         product_id=product_id,
         credits=safe_credits,
         currency=_first_string(data.get("currency"), metadata.get("currency")),
         amount=None,
-        provider_metadata={"event": event, "metadata": metadata},
+        provider_metadata={
+            "event": event,
+            "metadata": metadata,
+            "source_event_id": provider_event_id,
+            "provider_order_id": provider_order_id,
+        },
     )
     db.add(balance)
     db.add(grant)
+    await db.flush()
 
 
 async def _reconcile_waffo_credit_packs_for_customer(db: AsyncSession, customer: BillingCustomer) -> None:
@@ -1912,6 +1961,51 @@ async def license_status(
 ):
     """Return Catea Pro entitlement status for an email or license key."""
     return await _status_response(db, email=email, license_key=license_key)
+
+
+@router.get("/hosted/status")
+async def hosted_status(
+    authorization: Optional[str] = Header(default=None),
+    x_catea_license: Optional[str] = Header(default=None, alias="X-Catea-License"),
+    db: AsyncSession = Depends(get_db),
+):
+    """Validate hosted entitlement and report quota without calling the model."""
+    request_id = "hosted_status_" + secrets.token_urlsafe(18)
+    license_key = (x_catea_license or "").strip() or _bearer_token(authorization)
+    if not license_key:
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_401_UNAUTHORIZED,
+            "authorization_required",
+            "Catea Pro authorization is required.",
+        )
+    result = await db.execute(select(BillingCustomer).where(BillingCustomer.license_key == license_key))
+    customer = result.scalar_one_or_none()
+    if not customer:
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_401_UNAUTHORIZED,
+            "authorization_failed",
+            "Catea Pro authorization failed. Refresh your plan status and try again.",
+        )
+    subscription = await _get_subscription_status(db, customer)
+    if not subscription or not subscription.active:
+        return _hosted_error_response(
+            request_id,
+            status.HTTP_402_PAYMENT_REQUIRED,
+            "subscription_required",
+            "An active Catea Pro subscription is required.",
+        )
+    plan = await _ensure_pro_plan(db)
+    quota = await _quota_for_subscription(db, customer, subscription, plan)
+    return JSONResponse(
+        headers={HOSTED_REQUEST_ID_HEADER: request_id},
+        content={
+            "ok": True,
+            "provider_configured": bool(settings.catea_hosted_model_api_key),
+            "quota": jsonable_encoder(quota),
+        },
+    )
 
 
 @router.post("/hosted/v1/chat/completions")
