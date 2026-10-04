@@ -28,6 +28,8 @@ from app.auth import get_password_hash
 from app.config import settings
 from app.database import get_db
 from app.models import (
+    BillingCreditBalance,
+    BillingCreditGrant,
     BillingCustomer,
     BillingPlan,
     BillingPrice,
@@ -102,6 +104,33 @@ WAFFO_REVOKE_EVENTS = {
 
 
 PRO_PLAN_ID = "pro_monthly"
+CREDIT_PACKS = {
+    "credits_20k": {"credits": 20_000, "usd": "3.00", "cny": "18.00"},
+    "credits_50k": {"credits": 50_000, "usd": "6.00", "cny": "36.00"},
+    "credits_100k": {"credits": 100_000, "usd": "9.90", "cny": "60.00"},
+}
+
+
+def _credit_product_ids() -> dict[str, str]:
+    return {
+        "credits_20k": settings.waffo_product_id_credits_20k,
+        "credits_50k": settings.waffo_product_id_credits_50k,
+        "credits_100k": settings.waffo_product_id_credits_100k,
+    }
+
+
+def _credit_pack_for_plan(plan: str) -> Optional[dict[str, Any]]:
+    return CREDIT_PACKS.get(plan)
+
+
+def _credit_pack_for_product(product_id: Optional[str]) -> Optional[tuple[str, dict[str, Any]]]:
+    if not product_id:
+        return None
+    for plan, configured_product_id in _credit_product_ids().items():
+        if configured_product_id and product_id == configured_product_id:
+            return plan, CREDIT_PACKS[plan]
+    return None
+
 
 
 def _plan_for_product(product_id: Optional[str]) -> str:
@@ -123,6 +152,9 @@ def _product_for_plan(plan: str, currency: str = "USD") -> str:
     if settings.billing_provider.lower() == "xorpay":
         return _xorpay_product_id()
     if settings.billing_provider.lower() == "waffo":
+        credit_product = _credit_product_ids().get(plan)
+        if credit_product:
+            return credit_product
         if plan == "pro_30d" or currency == "CNY":
             return settings.waffo_product_id_pro_30d
         return settings.waffo_product_id_pro_monthly
@@ -202,6 +234,29 @@ async def _ensure_pro_plan(db: AsyncSession) -> BillingPlan:
         price.plan_id = plan.id
         price.currency = currency
         price.active = True
+    for plan_id, product_id in _credit_product_ids().items():
+        if not product_id:
+            continue
+        pack = CREDIT_PACKS[plan_id]
+        existing = await db.execute(
+            select(BillingPrice).where(
+                BillingPrice.provider == "waffo",
+                BillingPrice.provider_product_id == product_id,
+            )
+        )
+        price = existing.scalar_one_or_none()
+        if not price:
+            price = BillingPrice(
+                plan_id=plan.id,
+                provider="waffo",
+                provider_product_id=product_id,
+            )
+            db.add(price)
+        price.plan_id = plan.id
+        price.currency = "USD"
+        price.amount = int(round(float(pack["usd"]) * 100))
+        price.active = True
+
     if settings.xorpay_aid:
         product_id = _xorpay_product_id()
         existing = await db.execute(
@@ -261,6 +316,7 @@ async def _quota_for_subscription(
     plan: BillingPlan,
 ) -> dict[str, Any]:
     period, window = await _ensure_usage_buckets(db, customer, subscription, plan)
+    topup_balance = await _get_credit_balance(db, customer)
     monthly = _percent(period.used_credits, period.included_credits)
     monthly["reset_at"] = period.period_end
     monthly["included_credits"] = period.included_credits
@@ -269,7 +325,19 @@ async def _quota_for_subscription(
     window_quota["reset_at"] = window.window_end
     window_quota["included_credits"] = window.included_credits
     window_quota["used_credits"] = window.used_credits
-    return {"monthly": monthly, "window": window_quota}
+    return {"monthly": monthly, "window": window_quota, "topup": {"balance_credits": topup_balance.balance_credits}}
+
+
+async def _get_credit_balance(db: AsyncSession, customer: BillingCustomer) -> BillingCreditBalance:
+    result = await db.execute(
+        select(BillingCreditBalance).where(BillingCreditBalance.customer_id == customer.id)
+    )
+    balance = result.scalar_one_or_none()
+    if not balance:
+        balance = BillingCreditBalance(customer_id=customer.id, balance_credits=0)
+        db.add(balance)
+        await db.flush()
+    return balance
 
 
 async def _ensure_usage_buckets(
@@ -395,7 +463,8 @@ async def _get_active_hosted_customer(
         raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Catea Pro subscription is required")
     plan = await _ensure_pro_plan(db)
     period, window = await _ensure_usage_buckets(db, customer, subscription, plan)
-    if period.used_credits >= period.included_credits:
+    credit_balance = await _get_credit_balance(db, customer)
+    if period.used_credits >= period.included_credits and credit_balance.balance_credits <= 0:
         raise HTTPException(status_code=429, detail="Monthly hosted model quota exceeded")
     if window.used_credits >= window.included_credits:
         raise HTTPException(status_code=429, detail="Hosted model quota will reset soon")
@@ -596,6 +665,7 @@ async def _record_hosted_usage(
     credits: int,
 ) -> None:
     safe_credits = max(1, credits)
+    balance = await _get_credit_balance(db, customer)
     event = BillingUsageEvent(
         customer_id=customer.id,
         request_id=request_id,
@@ -604,7 +674,13 @@ async def _record_hosted_usage(
         output_tokens=max(0, output_tokens),
         credits=safe_credits,
     )
-    period.used_credits = min(period.included_credits, period.used_credits + safe_credits)
+    monthly_remaining = max(0, period.included_credits - period.used_credits)
+    monthly_credits = min(monthly_remaining, safe_credits)
+    topup_credits = max(0, safe_credits - monthly_credits)
+    period.used_credits = min(period.included_credits, period.used_credits + monthly_credits)
+    if topup_credits:
+        balance.balance_credits = max(0, balance.balance_credits - topup_credits)
+        db.add(balance)
     window.used_credits = min(window.included_credits, window.used_credits + safe_credits)
     db.add(event)
     db.add(period)
@@ -901,6 +977,45 @@ def _waffo_event_period(data: dict[str, Any]) -> tuple[Optional[datetime], Optio
     return start, end
 
 
+async def _grant_waffo_credits_from_event(
+    db: AsyncSession,
+    event: dict[str, Any],
+    customer: BillingCustomer,
+    product_id: str,
+    credits: int,
+) -> None:
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    metadata = data.get("orderMetadata") if isinstance(data.get("orderMetadata"), dict) else {}
+    provider_event_id = str(event.get("id") or event.get("eventId") or data.get("orderId") or data.get("id"))
+    if not provider_event_id or provider_event_id == "None":
+        provider_event_id = f"waffo:{customer.uuid}:{product_id}:{int(_now().timestamp())}"
+
+    existing = await db.execute(
+        select(BillingCreditGrant).where(
+            BillingCreditGrant.provider == "waffo",
+            BillingCreditGrant.provider_event_id == provider_event_id,
+        )
+    )
+    if existing.scalar_one_or_none():
+        return
+
+    balance = await _get_credit_balance(db, customer)
+    safe_credits = max(1, credits)
+    balance.balance_credits += safe_credits
+    grant = BillingCreditGrant(
+        customer_id=customer.id,
+        provider="waffo",
+        provider_event_id=provider_event_id,
+        product_id=product_id,
+        credits=safe_credits,
+        currency=_first_string(data.get("currency"), metadata.get("currency")),
+        amount=None,
+        metadata={"event": event, "metadata": metadata},
+    )
+    db.add(balance)
+    db.add(grant)
+
+
 async def _upsert_waffo_subscription_from_event(
     db: AsyncSession,
     event: dict[str, Any],
@@ -931,6 +1046,15 @@ async def _upsert_waffo_subscription_from_event(
         metadata.get("productId"),
         settings.waffo_product_id_pro_monthly,
     )
+    credit_pack_match = _credit_pack_for_product(product_id)
+    if credit_pack_match or metadata.get("billingMode") == "credits_pack":
+        pack_credits = int(metadata.get("credits") or (credit_pack_match[1]["credits"] if credit_pack_match else 0) or 0)
+        if pack_credits <= 0:
+            return
+        customer = await _get_or_create_customer(db, email, provider_customer_id=None, provider="waffo")
+        await _grant_waffo_credits_from_event(db, event, customer, product_id or "credits_pack", pack_credits)
+        return
+
     one_time_pass = bool(
         product_id
         and (
@@ -1118,8 +1242,9 @@ async def _create_waffo_checkout(
     product_id = _product_for_plan(payload.plan, payload.currency)
     if not product_id:
         raise HTTPException(status_code=500, detail=f"Waffo product for plan '{payload.plan}' is not configured")
-    one_time_pass = payload.plan == "pro_30d" or payload.currency == "CNY"
-    checkout_currency = "CNY" if one_time_pass else "USD"
+    credit_pack = _credit_pack_for_plan(payload.plan)
+    one_time_pass = bool(credit_pack) or payload.plan == "pro_30d" or payload.currency == "CNY"
+    checkout_currency = payload.currency if credit_pack else ("CNY" if one_time_pass else "USD")
     product_type = "onetime" if one_time_pass else "subscription"
 
     customer = await _get_or_create_customer(db, payload.email, provider="waffo")
@@ -1137,16 +1262,17 @@ async def _create_waffo_checkout(
             "referenceId": customer.uuid,
             "email": customer.email,
             "licenseKey": customer.license_key,
-            "plan": PRO_PLAN_ID,
+            "plan": payload.plan if credit_pack else PRO_PLAN_ID,
             "currency": checkout_currency,
             "requestedCurrency": payload.currency,
-            "billingMode": "one_time_30d" if one_time_pass else "subscription_monthly",
+            "billingMode": "credits_pack" if credit_pack else ("one_time_30d" if one_time_pass else "subscription_monthly"),
+            "credits": credit_pack["credits"] if credit_pack else None,
             "productId": product_id,
             "source": "catea",
         },
         "orderMerchantExternalId": request_id,
     }
-    if one_time_pass:
+    if one_time_pass and checkout_currency == "CNY":
         body["includePaymentMethods"] = ["wechat"]
     body_json = _waffo_body_json(body)
     timestamp = str(int(_now().timestamp()))

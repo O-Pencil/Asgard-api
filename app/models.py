@@ -1,5 +1,5 @@
 """
-[WHO]: Provides SQLAlchemy declarative models: User, APIKey, Agent, UsageLog, BalanceTransaction, BillingCustomer, BillingPlan, BillingPrice, BillingSubscription, BillingUsagePeriod, BillingUsageWindow, BillingUsageEvent, BillingWebhookEvent with relationships and constraints
+[WHO]: Provides SQLAlchemy declarative models: User, APIKey, Agent, UsageLog, BalanceTransaction, BillingCustomer, BillingPlan, BillingPrice, BillingSubscription, BillingUsagePeriod, BillingUsageWindow, BillingUsageEvent, BillingCreditBalance, BillingCreditGrant, BillingWebhookEvent with relationships and constraints
 [FROM]: Depends on SQLAlchemy for ORM, uuid for UUID generation, datetime for timestamps
 [TO]: Consumed by database.py for table creation, routers for CRUD operations, services for business logic
 [HERE]: packages/api/app/models.py - Database schema definitions; core data model for multi-tenant agent management
@@ -174,6 +174,8 @@ class BillingCustomer(Base):
     usage_periods = relationship("BillingUsagePeriod", back_populates="customer")
     usage_windows = relationship("BillingUsageWindow", back_populates="customer")
     usage_events = relationship("BillingUsageEvent", back_populates="customer")
+    credit_balance = relationship("BillingCreditBalance", back_populates="customer", uselist=False)
+    credit_grants = relationship("BillingCreditGrant", back_populates="customer")
 
 
 class BillingPlan(Base):
@@ -309,6 +311,45 @@ class BillingUsageEvent(Base):
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     customer = relationship("BillingCustomer", back_populates="usage_events")
+
+
+class BillingCreditBalance(Base):
+    """Purchased hosted-model credit balance for a billing customer."""
+    __tablename__ = table_name("billing_credit_balances")
+    __table_args__ = (
+        UniqueConstraint("customer_id", name="uq_billing_credit_balance_customer"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
+    customer_id = Column(Integer, ForeignKey(f"{BillingCustomer.__tablename__}.id"), nullable=False)
+    balance_credits = Column(Integer, default=0, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    customer = relationship("BillingCustomer", back_populates="credit_balance")
+
+
+class BillingCreditGrant(Base):
+    """Append-only record of purchased or manually granted hosted-model credits."""
+    __tablename__ = table_name("billing_credit_grants")
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_event_id", name="uq_billing_credit_grant_provider_event"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
+    customer_id = Column(Integer, ForeignKey(f"{BillingCustomer.__tablename__}.id"), nullable=False)
+    provider = Column(String(32), default="waffo", nullable=False, index=True)
+    provider_event_id = Column(String(128), nullable=False, index=True)
+    product_id = Column(String(128), index=True)
+    credits = Column(Integer, default=0, nullable=False)
+    currency = Column(String(8))
+    amount = Column(Float)
+    metadata = Column(JSON, default=dict)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+    customer = relationship("BillingCustomer", back_populates="credit_grants")
 
 
 class BillingWebhookEvent(Base):

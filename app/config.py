@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     waffo_private_key: str = ""
     waffo_product_id_pro_monthly: str = ""
     waffo_product_id_pro_30d: str = ""
+    waffo_product_id_credits_20k: str = ""
+    waffo_product_id_credits_50k: str = ""
+    waffo_product_id_credits_100k: str = ""
     waffo_webhook_public_key: str = ""
     waffo_content_safety_enabled: bool = False
     waffo_content_safety_api_base: str = "https://api.waffo.ai"
@@ -80,7 +83,7 @@ class Settings(BaseSettings):
     xorpay_app_secret: str = ""
     xorpay_notify_url: str = ""
     xorpay_pay_type: str = "cashier"
-    xorpay_pro_monthly_price_cny: str = "18.00"
+    xorpay_pro_monthly_price_cny: str = "60.00"
     catea_hosted_model_api_key: str = ""
     catea_hosted_model_base_url: str = "https://api.minimax.io/v1"
     catea_hosted_model_name: str = "MiniMax-M3.1-Flash-Preview"
