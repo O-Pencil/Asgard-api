@@ -1010,7 +1010,7 @@ async def _grant_waffo_credits_from_event(
         credits=safe_credits,
         currency=_first_string(data.get("currency"), metadata.get("currency")),
         amount=None,
-        metadata={"event": event, "metadata": metadata},
+        provider_metadata={"event": event, "metadata": metadata},
     )
     db.add(balance)
     db.add(grant)

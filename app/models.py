@@ -346,7 +346,7 @@ class BillingCreditGrant(Base):
     credits = Column(Integer, default=0, nullable=False)
     currency = Column(String(8))
     amount = Column(Float)
-    metadata = Column(JSON, default=dict)
+    provider_metadata = Column("metadata", JSON, default=dict)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     customer = relationship("BillingCustomer", back_populates="credit_grants")
