@@ -19,6 +19,9 @@ Unified Agent Integration Platform - Backend Service
 - Usage statistics and quotas
 - API Key management
 
+Hosted model usage follows the provider-neutral
+[Catea Credit accounting standard](./docs/CREDIT_ACCOUNTING.md).
+
 ## Quick Start
 
 ### 1. Clone and Install
