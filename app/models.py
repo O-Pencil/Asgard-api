@@ -6,7 +6,19 @@
 """
 from datetime import datetime
 from typing import Optional, List
-from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, ForeignKey, JSON, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    Column,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 import uuid
@@ -264,6 +276,7 @@ class BillingUsagePeriod(Base):
     period_end = Column(DateTime, nullable=False, index=True)
     included_credits = Column(Integer, default=0, nullable=False)
     used_credits = Column(Integer, default=0, nullable=False)
+    used_microcredits = Column(BigInteger, default=0, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -286,6 +299,7 @@ class BillingUsageWindow(Base):
     window_end = Column(DateTime, nullable=False, index=True)
     included_credits = Column(Integer, default=0, nullable=False)
     used_credits = Column(Integer, default=0, nullable=False)
+    used_microcredits = Column(BigInteger, default=0, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -308,6 +322,17 @@ class BillingUsageEvent(Base):
     input_tokens = Column(Integer, default=0, nullable=False)
     output_tokens = Column(Integer, default=0, nullable=False)
     credits = Column(Integer, default=0, nullable=False)
+    prompt_tokens_total = Column(Integer, default=0, nullable=False)
+    uncached_input_tokens = Column(Integer, default=0, nullable=False)
+    cache_read_tokens = Column(Integer, default=0, nullable=False)
+    cache_write_tokens = Column(Integer, default=0, nullable=False)
+    reasoning_tokens = Column(Integer, default=0, nullable=False)
+    weighted_token_millis = Column(BigInteger, default=0, nullable=False)
+    charged_microcredits = Column(BigInteger, default=0, nullable=False)
+    accounting_version = Column(String(32), default="catea-credit-v1", nullable=False)
+    credit_source = Column(String(32), default="monthly", nullable=False)
+    status = Column(String(32), default="completed", nullable=False)
+    usage_estimated = Column(Boolean, default=False, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
     customer = relationship("BillingCustomer", back_populates="usage_events")
@@ -324,6 +349,7 @@ class BillingCreditBalance(Base):
     uuid = Column(String(36), default=generate_uuid, unique=True, index=True)
     customer_id = Column(Integer, ForeignKey(f"{BillingCustomer.__tablename__}.id"), nullable=False)
     balance_credits = Column(Integer, default=0, nullable=False)
+    balance_microcredits = Column(BigInteger, default=0, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

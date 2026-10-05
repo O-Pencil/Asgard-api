@@ -65,7 +65,10 @@ def _quota(bucket: BillingUsagePeriod | BillingUsageWindow | None) -> Optional[d
     if not bucket:
         return None
     included = bucket.included_credits or 0
-    used = bucket.used_credits or 0
+    used_microcredits = max(0, int(bucket.used_microcredits or 0))
+    if used_microcredits == 0 and bucket.used_credits:
+        used_microcredits = int(bucket.used_credits) * 1_000_000
+    used = round(used_microcredits / 1_000_000, 6)
     used_percent = round(min(100, (used / included) * 100), 2) if included > 0 else 0
     return {
         "included_credits": included,
@@ -137,7 +140,10 @@ async def admin_overview(
     subscriptions = snapshot["subscriptions"]
     events = snapshot["events"]
     active_subscriptions = [subscription for subscription in subscriptions if subscription.active]
-    total_credits = sum(event.credits for event in events)
+    total_microcredits = sum(
+        event.charged_microcredits or event.credits * 1_000_000
+        for event in events
+    )
 
     return {
         "totals": {
@@ -145,7 +151,7 @@ async def admin_overview(
             "billing_customers": len(customers),
             "subscriptions": len(subscriptions),
             "active_subscriptions": len(active_subscriptions),
-            "recent_hosted_credits": total_credits,
+            "recent_hosted_credits": round(total_microcredits / 1_000_000, 6),
             "recent_hosted_events": len(events),
         },
         "plans": [
@@ -161,12 +167,13 @@ async def admin_overview(
             for plan in snapshot["plans"]
         ],
         "provider_quota": {
-            "provider": "minimax",
+            "provider": "hosted",
+            "model": "managed",
+            "base_url": None,
             "configured": bool(settings.catea_hosted_model_api_key),
-            "base_url": settings.catea_hosted_model_base_url,
-            "model": settings.catea_hosted_model_name,
-            "balance": None,
-            "note": "MiniMax provider-level quota endpoint is not wired yet.",
+            "accounting_version": "catea-credit-v1",
+            "quota_source": "catea",
+            "note": "Hosted usage is governed by Catea Credits.",
         },
         "recent_events": [
             {
@@ -175,7 +182,15 @@ async def admin_overview(
                 "model_route": event.model_route,
                 "input_tokens": event.input_tokens,
                 "output_tokens": event.output_tokens,
-                "credits": event.credits,
+                "prompt_tokens_total": event.prompt_tokens_total,
+                "uncached_input_tokens": event.uncached_input_tokens,
+                "cache_read_tokens": event.cache_read_tokens,
+                "cache_write_tokens": event.cache_write_tokens,
+                "reasoning_tokens": event.reasoning_tokens,
+                "weighted_token_millis": event.weighted_token_millis,
+                "credits": round(event.charged_microcredits / 1_000_000, 6),
+                "accounting_version": event.accounting_version,
+                "usage_estimated": event.usage_estimated,
                 "created_at": _dt(event.created_at),
             }
             for event in events

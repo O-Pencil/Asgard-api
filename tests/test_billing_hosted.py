@@ -20,8 +20,11 @@ from app.models import (
 from app.routers.billing import (
     HOSTED_REQUEST_ID_HEADER,
     _grant_waffo_credits_from_event,
+    _hosted_model_body,
     _hosted_upstream_error_response,
     _record_hosted_usage,
+    _usage_charge,
+    _usage_tokens,
     hosted_status,
 )
 
@@ -128,6 +131,7 @@ async def test_hosted_usage_consumes_monthly_before_topup(db_session: AsyncSessi
         period_end=now + timedelta(days=30),
         included_credits=100,
         used_credits=90,
+        used_microcredits=90_000_000,
     )
     window = BillingUsageWindow(
         customer_id=customer.id,
@@ -136,8 +140,13 @@ async def test_hosted_usage_consumes_monthly_before_topup(db_session: AsyncSessi
         window_end=now + timedelta(hours=5),
         included_credits=1_000,
         used_credits=0,
+        used_microcredits=0,
     )
-    balance = BillingCreditBalance(customer_id=customer.id, balance_credits=50)
+    balance = BillingCreditBalance(
+        customer_id=customer.id,
+        balance_credits=50,
+        balance_microcredits=50_000_000,
+    )
     db_session.add_all([period, window, balance])
     await db_session.commit()
 
@@ -148,9 +157,15 @@ async def test_hosted_usage_consumes_monthly_before_topup(db_session: AsyncSessi
         window,
         request_id="hosted_usage_order",
         model_route="test/model",
-        input_tokens=15,
-        output_tokens=15,
-        credits=30,
+        usage={
+            "prompt_tokens_total": 400,
+            "uncached_input_tokens": 400,
+            "output_tokens": 400,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "estimated": False,
+        },
     )
 
     await db_session.refresh(period)
@@ -160,9 +175,66 @@ async def test_hosted_usage_consumes_monthly_before_topup(db_session: AsyncSessi
         select(BillingUsageEvent).where(BillingUsageEvent.request_id == "hosted_usage_order")
     )
     assert period.used_credits == 100
-    assert balance.balance_credits == 30
-    assert window.used_credits == 30
-    assert event is not None and event.credits == 30
+    assert period.used_microcredits == 100_000_000
+    assert balance.balance_credits == 10
+    assert balance.balance_microcredits == 10_000_000
+    assert window.used_credits == 50
+    assert window.used_microcredits == 50_000_000
+    assert event is not None and event.credits == 50
+    assert event.charged_microcredits == 50_000_000
+    assert event.weighted_token_millis == 2_000_000
+    assert event.credit_source == "monthly+topup"
+
+
+def test_usage_accounting_parses_cache_classes_without_double_charging():
+    usage = _usage_tokens(
+        {
+            "usage": {
+                "prompt_tokens": 1_000,
+                "completion_tokens": 100,
+                "prompt_tokens_details": {
+                    "cached_tokens": 600,
+                    "cache_write_tokens": 100,
+                },
+                "completion_tokens_details": {"reasoning_tokens": 25},
+            }
+        },
+        fallback_input_tokens=5,
+    )
+
+    assert usage == {
+        "prompt_tokens_total": 1_000,
+        "uncached_input_tokens": 300,
+        "output_tokens": 100,
+        "cache_read_tokens": 600,
+        "cache_write_tokens": 100,
+        "reasoning_tokens": 25,
+        "estimated": False,
+    }
+    weighted_token_millis, charged_microcredits = _usage_charge(usage)
+    assert weighted_token_millis == 945_000
+    assert charged_microcredits == 23_625_000
+
+
+def test_usage_accounting_fallback_is_marked_estimated():
+    usage = _usage_tokens({}, fallback_input_tokens=120, fallback_output_tokens=40)
+
+    assert usage["estimated"] is True
+    assert usage["uncached_input_tokens"] == 120
+    assert usage["output_tokens"] == 40
+    assert _usage_charge(usage) == (280_000, 7_000_000)
+
+
+def test_hosted_stream_requests_authoritative_usage():
+    body = _hosted_model_body(
+        {
+            "model": "public-route",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        }
+    )
+
+    assert body["stream_options"] == {"include_usage": True}
 
 
 @pytest.mark.asyncio

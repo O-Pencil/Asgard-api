@@ -116,6 +116,12 @@ CREDIT_PACKS = {
 }
 
 HOSTED_REQUEST_ID_HEADER = "X-Catea-Request-Id"
+ACCOUNTING_VERSION = "catea-credit-v1"
+MICROCREDITS_PER_CREDIT = 1_000_000
+INPUT_MICROCREDITS_PER_TOKEN = 25_000
+OUTPUT_MICROCREDITS_PER_TOKEN = 100_000
+CACHE_READ_MICROCREDITS_PER_TOKEN = 5_000
+CACHE_WRITE_MICROCREDITS_PER_TOKEN = 31_250
 
 
 def _hosted_error_response(
@@ -407,11 +413,28 @@ async def _get_or_create_billing_price(
         raise
 
 
-def _percent(used: int, included: int) -> dict[str, Any]:
+def _percent(used: float, included: float) -> dict[str, Any]:
     if included <= 0:
         return {"used_percent": 0, "remaining_percent": 0}
     used_percent = min(100, round((used / included) * 100, 2))
     return {"used_percent": used_percent, "remaining_percent": max(0, round(100 - used_percent, 2))}
+
+
+def _credits_from_microcredits(value: int) -> float:
+    return round(max(0, value) / MICROCREDITS_PER_CREDIT, 6)
+
+
+def _used_microcredits(bucket: BillingUsagePeriod | BillingUsageWindow) -> int:
+    stored = max(0, int(bucket.used_microcredits or 0))
+    if stored > 0:
+        return stored
+    return max(0, int(bucket.used_credits or 0)) * MICROCREDITS_PER_CREDIT
+
+
+def _balance_microcredits(balance: BillingCreditBalance) -> int:
+    stored = max(0, int(balance.balance_microcredits or 0))
+    legacy = max(0, int(balance.balance_credits or 0)) * MICROCREDITS_PER_CREDIT
+    return max(stored, legacy)
 
 
 async def _quota_for_subscription(
@@ -428,20 +451,25 @@ async def _quota_for_subscription(
         )
     )
     topup_included = int(topup_granted or 0)
-    topup_remaining = max(0, int(topup_balance.balance_credits or 0))
-    topup_used = max(0, topup_included - topup_remaining)
-    monthly = _percent(period.used_credits, period.included_credits)
+    topup_included_microcredits = topup_included * MICROCREDITS_PER_CREDIT
+    topup_remaining_microcredits = _balance_microcredits(topup_balance)
+    topup_used_microcredits = max(0, topup_included_microcredits - topup_remaining_microcredits)
+    period_used_microcredits = _used_microcredits(period)
+    period_included_microcredits = period.included_credits * MICROCREDITS_PER_CREDIT
+    monthly = _percent(period_used_microcredits, period_included_microcredits)
     monthly["reset_at"] = period.period_end
     monthly["included_credits"] = period.included_credits
-    monthly["used_credits"] = period.used_credits
-    window_quota = _percent(window.used_credits, window.included_credits)
+    monthly["used_credits"] = _credits_from_microcredits(period_used_microcredits)
+    window_used_microcredits = _used_microcredits(window)
+    window_included_microcredits = window.included_credits * MICROCREDITS_PER_CREDIT
+    window_quota = _percent(window_used_microcredits, window_included_microcredits)
     window_quota["reset_at"] = window.window_end
     window_quota["included_credits"] = window.included_credits
-    window_quota["used_credits"] = window.used_credits
-    topup = _percent(topup_used, topup_included)
+    window_quota["used_credits"] = _credits_from_microcredits(window_used_microcredits)
+    topup = _percent(topup_used_microcredits, topup_included_microcredits)
     topup["included_credits"] = topup_included
-    topup["used_credits"] = topup_used
-    topup["balance_credits"] = topup_remaining
+    topup["used_credits"] = _credits_from_microcredits(topup_used_microcredits)
+    topup["balance_credits"] = _credits_from_microcredits(topup_remaining_microcredits)
     return {"monthly": monthly, "window": window_quota, "topup": topup}
 
 
@@ -451,7 +479,11 @@ async def _get_credit_balance(db: AsyncSession, customer: BillingCustomer) -> Bi
     )
     balance = result.scalar_one_or_none()
     if not balance:
-        balance = BillingCreditBalance(customer_id=customer.id, balance_credits=0)
+        balance = BillingCreditBalance(
+            customer_id=customer.id,
+            balance_credits=0,
+            balance_microcredits=0,
+        )
         db.add(balance)
         await db.flush()
     return balance
@@ -488,6 +520,7 @@ async def _ensure_usage_buckets(
             period_end=period_end,
             included_credits=plan.monthly_credits,
             used_credits=0,
+            used_microcredits=0,
         )
         db.add(period)
 
@@ -512,6 +545,7 @@ async def _ensure_usage_buckets(
             window_end=window_end,
             included_credits=plan.window_credits,
             used_credits=0,
+            used_microcredits=0,
         )
         db.add(window)
     await db.flush()
@@ -594,9 +628,12 @@ async def _get_active_hosted_customer(
     plan = await _ensure_pro_plan(db)
     period, window = await _ensure_usage_buckets(db, customer, subscription, plan)
     credit_balance = await _get_credit_balance(db, customer)
-    if period.used_credits >= period.included_credits and credit_balance.balance_credits <= 0:
+    if (
+        _used_microcredits(period) >= period.included_credits * MICROCREDITS_PER_CREDIT
+        and _balance_microcredits(credit_balance) <= 0
+    ):
         raise HTTPException(status_code=429, detail="Monthly hosted model quota exceeded")
-    if window.used_credits >= window.included_credits:
+    if _used_microcredits(window) >= window.included_credits * MICROCREDITS_PER_CREDIT:
         raise HTTPException(status_code=429, detail="Hosted model quota will reset soon")
     return customer, subscription, plan, period, window
 
@@ -773,10 +810,22 @@ def _raise_for_content_safety(verdict: dict[str, Any]) -> None:
     )
 
 
-def _usage_tokens(payload: dict[str, Any], fallback: int) -> tuple[int, int, int]:
+def _usage_tokens(
+    payload: dict[str, Any],
+    fallback_input_tokens: int,
+    fallback_output_tokens: int = 0,
+) -> dict[str, Any]:
     usage = payload.get("usage") if isinstance(payload, dict) else None
     if not isinstance(usage, dict):
-        return fallback, 0, fallback
+        return {
+            "prompt_tokens_total": max(0, fallback_input_tokens),
+            "uncached_input_tokens": max(0, fallback_input_tokens),
+            "output_tokens": max(0, fallback_output_tokens),
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "estimated": True,
+        }
 
     def token_count(value: Any) -> int:
         try:
@@ -784,10 +833,66 @@ def _usage_tokens(payload: dict[str, Any], fallback: int) -> tuple[int, int, int
         except (TypeError, ValueError):
             return 0
 
-    prompt = token_count(usage.get("prompt_tokens"))
-    completion = token_count(usage.get("completion_tokens"))
-    total = token_count(usage.get("total_tokens")) or prompt + completion or fallback
-    return prompt or fallback, completion, total
+    prompt_details = usage.get("prompt_tokens_details")
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+    completion_details = usage.get("completion_tokens_details")
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+
+    cache_read = token_count(
+        prompt_details.get("cache_read_tokens")
+        or prompt_details.get("cached_tokens")
+        or usage.get("cache_read_input_tokens")
+    )
+    cache_write = token_count(
+        prompt_details.get("cache_write_tokens")
+        or usage.get("cache_write_input_tokens")
+        or usage.get("cache_creation_input_tokens")
+    )
+    output = token_count(usage.get("completion_tokens") or usage.get("output_tokens"))
+    reasoning = token_count(
+        completion_details.get("reasoning_tokens") or usage.get("reasoning_tokens")
+    )
+
+    if "prompt_tokens" in usage:
+        prompt_total = token_count(usage.get("prompt_tokens")) or max(0, fallback_input_tokens)
+        cache_read = min(cache_read, prompt_total)
+        cache_write = min(cache_write, max(0, prompt_total - cache_read))
+        uncached_input = max(0, prompt_total - cache_read - cache_write)
+    else:
+        uncached_input = token_count(usage.get("input_tokens")) or max(0, fallback_input_tokens)
+        prompt_total = uncached_input + cache_read + cache_write
+
+    return {
+        "prompt_tokens_total": prompt_total,
+        "uncached_input_tokens": uncached_input,
+        "output_tokens": output,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "reasoning_tokens": min(reasoning, output) if output else reasoning,
+        "estimated": False,
+    }
+
+
+def _usage_charge(usage: dict[str, Any]) -> tuple[int, int]:
+    uncached_input = max(0, int(usage.get("uncached_input_tokens") or 0))
+    output = max(0, int(usage.get("output_tokens") or 0))
+    cache_read = max(0, int(usage.get("cache_read_tokens") or 0))
+    cache_write = max(0, int(usage.get("cache_write_tokens") or 0))
+    weighted_token_millis = (
+        uncached_input * 1_000
+        + output * 4_000
+        + cache_read * 200
+        + cache_write * 1_250
+    )
+    charged_microcredits = (
+        uncached_input * INPUT_MICROCREDITS_PER_TOKEN
+        + output * OUTPUT_MICROCREDITS_PER_TOKEN
+        + cache_read * CACHE_READ_MICROCREDITS_PER_TOKEN
+        + cache_write * CACHE_WRITE_MICROCREDITS_PER_TOKEN
+    )
+    return weighted_token_millis, charged_microcredits
 
 
 async def _record_hosted_usage(
@@ -797,11 +902,9 @@ async def _record_hosted_usage(
     window: BillingUsageWindow,
     request_id: str,
     model_route: str,
-    input_tokens: int,
-    output_tokens: int,
-    credits: int,
-) -> None:
-    safe_credits = max(1, credits)
+    usage: dict[str, Any],
+) -> int:
+    weighted_token_millis, charged_microcredits = _usage_charge(usage)
     # Serialize successful usage updates so concurrent requests cannot overwrite
     # each other's counters while retaining separate append-only usage events.
     locked_period = await db.scalar(
@@ -823,32 +926,72 @@ async def _record_hosted_usage(
         raise RuntimeError("Hosted usage bucket disappeared before accounting")
     if not balance:
         balance = await _get_credit_balance(db, customer)
+    period_used_microcredits = _used_microcredits(locked_period)
+    window_used_microcredits = _used_microcredits(locked_window)
+    balance_microcredits = _balance_microcredits(balance)
+    monthly_included_microcredits = locked_period.included_credits * MICROCREDITS_PER_CREDIT
+    window_included_microcredits = locked_window.included_credits * MICROCREDITS_PER_CREDIT
+    monthly_remaining_microcredits = max(
+        0,
+        monthly_included_microcredits - period_used_microcredits,
+    )
+    monthly_microcredits = min(monthly_remaining_microcredits, charged_microcredits)
+    topup_microcredits = max(0, charged_microcredits - monthly_microcredits)
+    if monthly_microcredits and topup_microcredits:
+        credit_source = "monthly+topup"
+    elif topup_microcredits:
+        credit_source = "topup"
+    else:
+        credit_source = "monthly"
+    compatibility_credits = (
+        charged_microcredits + MICROCREDITS_PER_CREDIT - 1
+    ) // MICROCREDITS_PER_CREDIT
     event = BillingUsageEvent(
         customer_id=customer.id,
         request_id=request_id,
         model_route=model_route,
-        input_tokens=max(0, input_tokens),
-        output_tokens=max(0, output_tokens),
-        credits=safe_credits,
+        input_tokens=max(0, int(usage.get("prompt_tokens_total") or 0)),
+        output_tokens=max(0, int(usage.get("output_tokens") or 0)),
+        credits=compatibility_credits,
+        prompt_tokens_total=max(0, int(usage.get("prompt_tokens_total") or 0)),
+        uncached_input_tokens=max(0, int(usage.get("uncached_input_tokens") or 0)),
+        cache_read_tokens=max(0, int(usage.get("cache_read_tokens") or 0)),
+        cache_write_tokens=max(0, int(usage.get("cache_write_tokens") or 0)),
+        reasoning_tokens=max(0, int(usage.get("reasoning_tokens") or 0)),
+        weighted_token_millis=weighted_token_millis,
+        charged_microcredits=charged_microcredits,
+        accounting_version=ACCOUNTING_VERSION,
+        credit_source=credit_source,
+        status="completed",
+        usage_estimated=bool(usage.get("estimated")),
     )
-    monthly_remaining = max(0, locked_period.included_credits - locked_period.used_credits)
-    monthly_credits = min(monthly_remaining, safe_credits)
-    topup_credits = max(0, safe_credits - monthly_credits)
+    locked_period.used_microcredits = min(
+        monthly_included_microcredits,
+        period_used_microcredits + monthly_microcredits,
+    )
     locked_period.used_credits = min(
         locked_period.included_credits,
-        locked_period.used_credits + monthly_credits,
+        (locked_period.used_microcredits + MICROCREDITS_PER_CREDIT - 1)
+        // MICROCREDITS_PER_CREDIT,
     )
-    if topup_credits:
-        balance.balance_credits = max(0, balance.balance_credits - topup_credits)
+    if topup_microcredits:
+        balance.balance_microcredits = max(0, balance_microcredits - topup_microcredits)
+        balance.balance_credits = balance.balance_microcredits // MICROCREDITS_PER_CREDIT
         db.add(balance)
+    locked_window.used_microcredits = min(
+        window_included_microcredits,
+        window_used_microcredits + charged_microcredits,
+    )
     locked_window.used_credits = min(
         locked_window.included_credits,
-        locked_window.used_credits + safe_credits,
+        (locked_window.used_microcredits + MICROCREDITS_PER_CREDIT - 1)
+        // MICROCREDITS_PER_CREDIT,
     )
     db.add(event)
     db.add(locked_period)
     db.add(locked_window)
     await db.commit()
+    return charged_microcredits
 
 
 def _hosted_model_url() -> str:
@@ -860,6 +1003,12 @@ def _hosted_model_body(request: dict[str, Any]) -> dict[str, Any]:
     body["model"] = settings.catea_hosted_model_name
     if settings.catea_hosted_model_reasoning_effort:
         body.setdefault("reasoning_effort", settings.catea_hosted_model_reasoning_effort)
+    if body.get("stream") is True:
+        stream_options = body.get("stream_options")
+        if not isinstance(stream_options, dict):
+            stream_options = {}
+        stream_options.setdefault("include_usage", True)
+        body["stream_options"] = stream_options
     return body
 
 
@@ -1206,6 +1355,8 @@ async def _grant_waffo_credits_from_event(
     if not balance:
         balance = await _get_credit_balance(db, customer)
     safe_credits = max(1, credits)
+    current_microcredits = _balance_microcredits(balance)
+    balance.balance_microcredits = current_microcredits + safe_credits * MICROCREDITS_PER_CREDIT
     balance.balance_credits += safe_credits
     grant = BillingCreditGrant(
         customer_id=customer.id,
@@ -2163,7 +2314,7 @@ async def hosted_chat_completions(
         async def generate_stream():
             output_chars = 0
             completed = False
-            upstream_usage: Optional[tuple[int, int, int]] = None
+            upstream_usage: Optional[dict[str, Any]] = None
             try:
                 async for line in response.aiter_lines():
                     if not line:
@@ -2207,28 +2358,30 @@ async def hosted_chat_completions(
             if not completed:
                 return
             fallback_output_tokens = max(0, output_chars // 4)
-            input_tokens, output_tokens, total_tokens = upstream_usage or (
+            usage = upstream_usage or _usage_tokens(
+                {},
                 prompt_tokens,
                 fallback_output_tokens,
-                prompt_tokens + fallback_output_tokens,
             )
             try:
-                await _record_hosted_usage(
+                charged_microcredits = await _record_hosted_usage(
                     db=db,
                     customer=customer,
                     period=period,
                     window=window,
                     request_id=request_id,
                     model_route=settings.catea_hosted_model_name,
-                    input_tokens=input_tokens,
-                    output_tokens=output_tokens,
-                    credits=total_tokens,
+                    usage=usage,
                 )
             except Exception:
                 await db.rollback()
                 logger.exception("Hosted request %s usage accounting failed after stream", request_id)
             else:
-                logger.info("Hosted request %s completed stream credits=%s", request_id, total_tokens)
+                logger.info(
+                    "Hosted request %s completed stream microcredits=%s",
+                    request_id,
+                    charged_microcredits,
+                )
 
         return StreamingResponse(
             generate_stream(),
@@ -2296,24 +2449,26 @@ async def hosted_chat_completions(
             "upstream_protocol_error",
             "Catea's hosted model returned an invalid response. Please try again later.",
         )
-    input_tokens, output_tokens, total_tokens = _usage_tokens(body, prompt_tokens)
+    usage = _usage_tokens(body, prompt_tokens)
     try:
-        await _record_hosted_usage(
+        charged_microcredits = await _record_hosted_usage(
             db=db,
             customer=customer,
             period=period,
             window=window,
             request_id=request_id,
             model_route=settings.catea_hosted_model_name,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            credits=total_tokens,
+            usage=usage,
         )
     except Exception:
         await db.rollback()
         logger.exception("Hosted request %s usage accounting failed after response", request_id)
     else:
-        logger.info("Hosted request %s completed credits=%s", request_id, total_tokens)
+        logger.info(
+            "Hosted request %s completed microcredits=%s",
+            request_id,
+            charged_microcredits,
+        )
     return JSONResponse(content=body, headers={HOSTED_REQUEST_ID_HEADER: request_id})
 
 

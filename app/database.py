@@ -4,6 +4,9 @@
 [TO]: Consumed by main.py for lifespan events, routers for database operations, models for table creation
 [HERE]: packages/api/app/database.py - Async database connection management; provides request-scoped sessions with automatic commit/rollback
 """
+from pathlib import Path
+
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
@@ -61,6 +64,30 @@ async def init_db():
     from app.models import Base
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        if engine.dialect.name == "postgresql":
+            accounting_version_exists = await conn.scalar(
+                text(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM information_schema.columns
+                        WHERE table_schema = 'public'
+                          AND table_name = 'asgard_billing_usage_events'
+                          AND column_name = 'accounting_version'
+                    )
+                    """
+                )
+            )
+            if not accounting_version_exists:
+                migration_path = (
+                    Path(__file__).resolve().parents[1]
+                    / "migrations"
+                    / "20261005135722_hosted-credit-accounting.sql"
+                )
+                migration_sql = migration_path.read_text(encoding="utf-8")
+                for statement in migration_sql.split(";"):
+                    if statement.strip():
+                        await conn.execute(text(statement))
 
 
 async def close_db():
