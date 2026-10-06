@@ -53,7 +53,7 @@ from app.schemas import (
 router = APIRouter(prefix="", tags=["Billing"])
 logger = logging.getLogger(__name__)
 
-ACTIVE_STATUSES = {"active", "trialing", "paid", "scheduled_cancel"}
+ACTIVE_STATUSES = {"active", "trialing", "paid", "scheduled_cancel", "canceling"}
 GRANT_EVENTS = {"checkout.completed", "subscription.active", "subscription.paid", "subscription.trialing"}
 REVOKE_EVENTS = {"subscription.expired", "subscription.paused"}
 
@@ -98,13 +98,14 @@ WAFFO_GRANT_EVENTS = {
     "subscription.activated",
     "subscription.payment_succeeded",
     "subscription.paid",
+    "subscription.renewed",
+    "subscription.recovered",
 }
 WAFFO_REVOKE_EVENTS = {
     "subscription.canceled",
     "subscription.cancelled",
     "subscription.expired",
     "subscription.paused",
-    "subscription.past_due",
 }
 
 
@@ -131,6 +132,8 @@ def _hosted_error_response(
     message: str,
     *,
     retry_after: Optional[str] = None,
+    retryable: bool = False,
+    reset_at: Optional[datetime] = None,
 ) -> JSONResponse:
     """Return a stable OpenAI-compatible error without exposing upstream details."""
     headers = {HOSTED_REQUEST_ID_HEADER: request_id}
@@ -145,6 +148,8 @@ def _hosted_error_response(
                 "type": "catea_hosted_error",
                 "code": code,
                 "request_id": request_id,
+                "retryable": retryable,
+                **({"reset_at": reset_at.isoformat() + "Z"} if reset_at else {}),
             }
         },
     )
@@ -155,12 +160,14 @@ def _hosted_http_error_response(request_id: str, exc: HTTPException) -> JSONResp
     detail = exc.detail if isinstance(exc.detail, dict) else {}
     detail_code = detail.get("code") if isinstance(detail.get("code"), str) else ""
     detail_message = detail.get("message") if isinstance(detail.get("message"), str) else ""
+    detail_reset_at = _parse_datetime(detail.get("reset_at"))
     if detail_code.startswith("content_safety_"):
         return _hosted_error_response(
             request_id,
             exc.status_code,
             detail_code,
             detail_message or "This request could not be processed under Catea's AI usage policy.",
+            retryable=detail_code == "content_safety_unavailable",
         )
     if exc.status_code == status.HTTP_401_UNAUTHORIZED:
         return _hosted_error_response(
@@ -173,17 +180,16 @@ def _hosted_http_error_response(request_id: str, exc: HTTPException) -> JSONResp
         return _hosted_error_response(
             request_id,
             status.HTTP_402_PAYMENT_REQUIRED,
-            "subscription_required",
-            "An active Catea Pro subscription is required.",
+            detail_code or "subscription_required",
+            detail_message or "An active Catea Pro subscription is required.",
         )
     if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
-        raw_detail = str(exc.detail).lower()
-        code = "window_quota_exceeded" if "reset soon" in raw_detail else "quota_exceeded"
         return _hosted_error_response(
             request_id,
             status.HTTP_429_TOO_MANY_REQUESTS,
-            code,
-            "Catea Pro usage is temporarily unavailable. Check your plan usage and try again later.",
+            detail_code or "monthly_quota_exceeded",
+            detail_message or "The available Catea credits have been used.",
+            reset_at=detail_reset_at,
         )
     if exc.status_code in {status.HTTP_400_BAD_REQUEST, status.HTTP_422_UNPROCESSABLE_ENTITY}:
         return _hosted_error_response(
@@ -197,6 +203,7 @@ def _hosted_http_error_response(request_id: str, exc: HTTPException) -> JSONResp
         status.HTTP_503_SERVICE_UNAVAILABLE,
         detail_code or "service_unavailable",
         "Catea's hosted model is temporarily unavailable. Please try again later.",
+        retryable=True,
     )
 
 
@@ -209,10 +216,11 @@ def _hosted_upstream_error_response(
     if upstream_status == status.HTTP_429_TOO_MANY_REQUESTS:
         return _hosted_error_response(
             request_id,
-            status.HTTP_429_TOO_MANY_REQUESTS,
+            status.HTTP_503_SERVICE_UNAVAILABLE,
             "upstream_rate_limited",
             "Catea's hosted model is busy. Please try again shortly.",
             retry_after=retry_after,
+            retryable=True,
         )
     if upstream_status in {status.HTTP_400_BAD_REQUEST, status.HTTP_422_UNPROCESSABLE_ENTITY}:
         return _hosted_error_response(
@@ -226,6 +234,7 @@ def _hosted_upstream_error_response(
         status.HTTP_503_SERVICE_UNAVAILABLE,
         "upstream_unavailable",
         "Catea's hosted model is temporarily unavailable. Please try again later.",
+        retryable=True,
     )
 
 
@@ -621,10 +630,20 @@ async def _get_active_hosted_customer(
     result = await db.execute(select(BillingCustomer).where(BillingCustomer.license_key == license_key))
     customer = result.scalar_one_or_none()
     if not customer:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid Catea Pro license")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"code": "authorization_failed", "message": "Catea Pro authorization failed."},
+        )
     subscription = await _get_subscription_status(db, customer)
     if not subscription or not subscription.active:
-        raise HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail="Catea Pro subscription is required")
+        expired = bool(subscription and subscription.status == "expired")
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail={
+                "code": "subscription_expired" if expired else "subscription_required",
+                "message": "The Catea Pro subscription has expired." if expired else "An active Catea Pro subscription is required.",
+            },
+        )
     plan = await _ensure_pro_plan(db)
     period, window = await _ensure_usage_buckets(db, customer, subscription, plan)
     credit_balance = await _get_credit_balance(db, customer)
@@ -632,9 +651,23 @@ async def _get_active_hosted_customer(
         _used_microcredits(period) >= period.included_credits * MICROCREDITS_PER_CREDIT
         and _balance_microcredits(credit_balance) <= 0
     ):
-        raise HTTPException(status_code=429, detail="Monthly hosted model quota exceeded")
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "monthly_quota_exceeded",
+                "message": "The monthly and extra Catea credits have been used.",
+                "reset_at": period.period_end.isoformat() + "Z",
+            },
+        )
     if _used_microcredits(window) >= window.included_credits * MICROCREDITS_PER_CREDIT:
-        raise HTTPException(status_code=429, detail="Hosted model quota will reset soon")
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "code": "window_quota_exceeded",
+                "message": "The current usage window has reached its limit.",
+                "reset_at": window.window_end.isoformat() + "Z",
+            },
+        )
     return customer, subscription, plan, period, window
 
 
@@ -1378,6 +1411,69 @@ async def _grant_waffo_credits_from_event(
     await db.flush()
 
 
+async def _apply_waffo_refund_event(db: AsyncSession, event: dict[str, Any]) -> None:
+    """Revoke the order entitlement after Pancake confirms a settled refund."""
+    data = event.get("data") if isinstance(event.get("data"), dict) else {}
+    order_id = _first_string(data.get("orderId"), data.get("order_id"))
+    refund_id = _first_string(event.get("eventId"), event.get("id"))
+    if not order_id or not refund_id:
+        return
+
+    subscriptions = await db.scalars(
+        select(BillingSubscription).where(
+            BillingSubscription.provider == "waffo",
+            BillingSubscription.provider_order_id == order_id,
+        )
+    )
+    for subscription in subscriptions:
+        subscription.active = False
+        subscription.status = "refunded"
+        subscription.canceled_at = _now()
+        subscription.updated_at = _now()
+        db.add(subscription)
+
+    grant = await db.scalar(
+        select(BillingCreditGrant).where(
+            BillingCreditGrant.provider == "waffo",
+            BillingCreditGrant.provider_event_id == f"order:{order_id}",
+        )
+    )
+    if not grant:
+        await db.flush()
+        return
+    reversal_id = f"refund:{refund_id}"
+    existing = await db.scalar(
+        select(BillingCreditGrant).where(
+            BillingCreditGrant.provider == "waffo",
+            BillingCreditGrant.provider_event_id == reversal_id,
+        )
+    )
+    if existing:
+        return
+    balance = await db.scalar(
+        select(BillingCreditBalance)
+        .where(BillingCreditBalance.customer_id == grant.customer_id)
+        .with_for_update()
+    )
+    revoked_microcredits = max(0, grant.credits) * MICROCREDITS_PER_CREDIT
+    if balance:
+        balance.balance_microcredits = max(0, _balance_microcredits(balance) - revoked_microcredits)
+        balance.balance_credits = balance.balance_microcredits // MICROCREDITS_PER_CREDIT
+        db.add(balance)
+    db.add(
+        BillingCreditGrant(
+            customer_id=grant.customer_id,
+            provider="waffo",
+            provider_event_id=reversal_id,
+            product_id=grant.product_id,
+            credits=-max(0, grant.credits),
+            currency=_first_string(data.get("currency"), grant.currency),
+            provider_metadata={"event": event, "reverses": grant.provider_event_id},
+        )
+    )
+    await db.flush()
+
+
 async def _reconcile_waffo_credit_packs_for_customer(db: AsyncSession, customer: BillingCustomer) -> None:
     if settings.billing_provider.lower() != "waffo":
         return
@@ -1532,6 +1628,15 @@ async def _upsert_waffo_subscription_from_event(
     elif event_type in WAFFO_REVOKE_EVENTS:
         status_value = raw_status or event_type.removeprefix("subscription.")
         active = status_value in {"canceling", "scheduled_cancel"}
+    elif event_type == "subscription.canceling":
+        status_value = "canceling"
+        active = True
+    elif event_type == "subscription.uncanceled":
+        status_value = "active"
+        active = True
+    elif event_type == "subscription.past_due":
+        status_value = "past_due"
+        active = True
     else:
         status_value = raw_status or "active"
         active = status_value in ACTIVE_STATUSES
@@ -2024,9 +2129,10 @@ async def waffo_webhook(request: Request, db: AsyncSession = Depends(get_db)):
     try:
         if str(event_type) in WAFFO_GRANT_EVENTS or str(event_type).startswith("subscription."):
             await _upsert_waffo_subscription_from_event(db, event)
-        elif str(event_type) in {"refund.created", "dispute.created", "order.refunded"}:
-            # Conservative MVP behavior: record the event; manual review can
-            # revoke access if needed once refund/dispute policy is finalized.
+        elif str(event_type) == "refund.succeeded":
+            await _apply_waffo_refund_event(db, event)
+        elif str(event_type) == "refund.failed":
+            # Funds did not move, so entitlements remain unchanged.
             pass
         event_record.processed = True
         event_record.processed_at = _now()
@@ -2175,6 +2281,7 @@ async def hosted_chat_completions(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "service_not_configured",
             "Catea's hosted model is temporarily unavailable. Please try again later.",
+            retryable=True,
         )
     license_key = (x_catea_license or "").strip() or _bearer_token(authorization)
     if not license_key:
@@ -2198,6 +2305,7 @@ async def hosted_chat_completions(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "entitlement_unavailable",
             "Catea Pro authorization is temporarily unavailable. Please try again later.",
+            retryable=True,
         )
     try:
         payload = await request.json()
@@ -2235,6 +2343,7 @@ async def hosted_chat_completions(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "content_safety_unavailable",
             "Catea's safety check is temporarily unavailable. Please try again later.",
+            retryable=True,
         )
     outbound_body = _hosted_model_body(payload)
     headers = {
@@ -2268,6 +2377,7 @@ async def hosted_chat_completions(
                 status.HTTP_504_GATEWAY_TIMEOUT,
                 "upstream_timeout",
                 "Catea's hosted model timed out. Please try again.",
+                retryable=True,
             )
         except httpx.HTTPError as exc:
             await client.aclose()
@@ -2281,6 +2391,7 @@ async def hosted_chat_completions(
                 status.HTTP_503_SERVICE_UNAVAILABLE,
                 "upstream_unavailable",
                 "Catea's hosted model is temporarily unavailable. Please try again later.",
+                retryable=True,
             )
         if response.status_code >= 400:
             upstream_status = response.status_code
@@ -2309,6 +2420,7 @@ async def hosted_chat_completions(
                 status.HTTP_502_BAD_GATEWAY,
                 "upstream_protocol_error",
                 "Catea's hosted model returned an invalid response. Please try again later.",
+                retryable=True,
             )
 
         async def generate_stream():
@@ -2403,6 +2515,7 @@ async def hosted_chat_completions(
             status.HTTP_504_GATEWAY_TIMEOUT,
             "upstream_timeout",
             "Catea's hosted model timed out. Please try again.",
+            retryable=True,
         )
     except httpx.HTTPError as exc:
         logger.warning(
@@ -2415,6 +2528,7 @@ async def hosted_chat_completions(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "upstream_unavailable",
             "Catea's hosted model is temporarily unavailable. Please try again later.",
+            retryable=True,
         )
     if response.status_code >= 400:
         logger.warning(
@@ -2440,6 +2554,7 @@ async def hosted_chat_completions(
             status.HTTP_502_BAD_GATEWAY,
             "upstream_protocol_error",
             "Catea's hosted model returned an invalid response. Please try again later.",
+            retryable=True,
         )
     if not isinstance(body, dict):
         logger.warning("Hosted request %s received non-object JSON response", request_id)
@@ -2448,6 +2563,7 @@ async def hosted_chat_completions(
             status.HTTP_502_BAD_GATEWAY,
             "upstream_protocol_error",
             "Catea's hosted model returned an invalid response. Please try again later.",
+            retryable=True,
         )
     usage = _usage_tokens(body, prompt_tokens)
     try:

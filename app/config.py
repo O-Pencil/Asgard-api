@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     api_port: int = 8000
     debug: bool = False
     allowed_hosts: str = ""  # 逗号分隔的域名列表，生产环境使用
+    expose_api_docs: bool = False
 
     # OpenAI Compatibility
     openai_api_base: str = "http://localhost:8000/v1"

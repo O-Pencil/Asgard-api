@@ -144,20 +144,21 @@ app = FastAPI(
     title="Asgard API",
     description="Unified Agent Integration Platform - OpenAI Compatible Gateway",
     version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
+    docs_url="/docs" if settings.expose_api_docs else None,
+    redoc_url="/redoc" if settings.expose_api_docs else None,
+    openapi_url="/openapi.json" if settings.expose_api_docs else None,
     lifespan=lifespan
 )
 
 # CORS middleware
 cors_origins = settings.allowed_hosts.split(",") if settings.allowed_hosts else []
-if settings.debug or settings.single_user_mode:
-    # 调试模式 / 体验版：允许所有来源
+if settings.debug:
+    # Explicit debug mode only; single-user mode is not a CORS security boundary.
     cors_origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_credentials=cors_origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -165,7 +166,15 @@ app.add_middleware(
 # Rate limiting middleware
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
-    return await rate_limit_middleware(request, call_next)
+    response = await rate_limit_middleware(request, call_next)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    forwarded_proto = request.headers.get("x-forwarded-proto", "")
+    if request.url.scheme == "https" or forwarded_proto == "https":
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
 
 
 # Exception handlers

@@ -19,7 +19,9 @@ from app.models import (
 )
 from app.routers.billing import (
     HOSTED_REQUEST_ID_HEADER,
+    _apply_waffo_refund_event,
     _grant_waffo_credits_from_event,
+    _hosted_error_response,
     _hosted_model_body,
     _hosted_upstream_error_response,
     _record_hosted_usage,
@@ -53,6 +55,7 @@ def test_hosted_upstream_errors_hide_provider_details():
             "type": "catea_hosted_error",
             "code": "upstream_unavailable",
             "request_id": "hosted_test",
+            "retryable": True,
         }
     }
     assert "401" not in response.body.decode()
@@ -61,9 +64,27 @@ def test_hosted_upstream_errors_hide_provider_details():
 def test_hosted_rate_limit_preserves_retry_hint():
     response = _hosted_upstream_error_response("hosted_rate", 429, "12")
 
-    assert response.status_code == 429
+    assert response.status_code == 503
     assert response.headers["Retry-After"] == "12"
-    assert json.loads(response.body)["error"]["code"] == "upstream_rate_limited"
+    error = json.loads(response.body)["error"]
+    assert error["code"] == "upstream_rate_limited"
+    assert error["retryable"] is True
+
+
+def test_hosted_quota_error_includes_stable_code_and_reset_time():
+    reset_at = datetime(2026, 10, 6, 12, 30)
+    response = _hosted_error_response(
+        "hosted_quota",
+        429,
+        "window_quota_exceeded",
+        "The current usage window has reached its limit.",
+        reset_at=reset_at,
+    )
+
+    error = json.loads(response.body)["error"]
+    assert error["code"] == "window_quota_exceeded"
+    assert error["retryable"] is False
+    assert error["reset_at"] == "2026-10-06T12:30:00Z"
 
 
 @pytest.mark.asyncio
@@ -367,3 +388,48 @@ async def test_credit_grant_recognizes_legacy_reconciliation_record(db_session: 
     ).all()
     assert balance is not None and balance.balance_credits == 20_000
     assert len(grants) == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_refund_revokes_credit_pack_without_negative_balance(
+    db_session: AsyncSession,
+):
+    customer = BillingCustomer(
+        email="credit-refund@example.com",
+        provider="waffo",
+        license_key="catea_credit_refund_test",
+    )
+    db_session.add(customer)
+    await db_session.flush()
+    await _grant_waffo_credits_from_event(
+        db_session,
+        credit_event("evt_purchase", "order_refunded"),
+        customer,
+        "credits_20k",
+        20_000,
+    )
+    balance = await db_session.scalar(
+        select(BillingCreditBalance).where(BillingCreditBalance.customer_id == customer.id)
+    )
+    assert balance is not None
+    balance.balance_credits = 5_000
+    balance.balance_microcredits = 5_000_000_000
+    await _apply_waffo_refund_event(
+        db_session,
+        {
+            "id": "refund_one",
+            "eventId": "refund_one",
+            "eventType": "refund.succeeded",
+            "data": {"orderId": "order_refunded", "currency": "USD"},
+        },
+    )
+
+    await db_session.refresh(balance)
+    reversal = await db_session.scalar(
+        select(BillingCreditGrant).where(
+            BillingCreditGrant.provider_event_id == "refund:refund_one"
+        )
+    )
+    assert balance.balance_credits == 0
+    assert balance.balance_microcredits == 0
+    assert reversal is not None and reversal.credits == -20_000
